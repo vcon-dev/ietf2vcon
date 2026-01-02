@@ -1,0 +1,10 @@
+{
+  "id": 5003,
+  "resource_uri": "/api/v1/doc/document/recording-121-vcon-1/",
+  "name": "recording-121-vcon-1",
+  "title": "Video recording for IETF 121 VCON Session 1",
+  "type": "/api/v1/name/doctypename/recording/",
+  "rev": "00",
+  "abstract": "",
+  "external_url": "https://www.youtube.com/watch?v=DfNKgMvbn1o"
+}

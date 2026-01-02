@@ -1,0 +1,46 @@
+{
+  "wireMagic": "pb3",
+  "pens": [],
+  "wsWinStyles": [],
+  "wpWinPositions": [],
+  "events": [
+    {
+      "tStartMs": 0,
+      "dDurationMs": 5000,
+      "segs": [
+        {"utf8": "Welcome to the IETF 121 "},
+        {"utf8": "VCON working group session."}
+      ]
+    },
+    {
+      "tStartMs": 5000,
+      "dDurationMs": 4500,
+      "segs": [
+        {"utf8": "Today we'll be discussing "},
+        {"utf8": "the vCon container format."}
+      ]
+    },
+    {
+      "tStartMs": 9500,
+      "dDurationMs": 3000,
+      "segs": [
+        {"utf8": "Let's begin with the agenda."}
+      ]
+    },
+    {
+      "tStartMs": 12500,
+      "dDurationMs": 4000,
+      "segs": [
+        {"utf8": "First item: status update "},
+        {"utf8": "on the draft."}
+      ]
+    },
+    {
+      "tStartMs": 16500,
+      "dDurationMs": 3500,
+      "segs": [
+        {"utf8": "We've made significant progress."}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "meta": {
+    "limit": 100,
+    "next": null,
+    "offset": 0,
+    "previous": null,
+    "total_count": 3
+  },
+  "objects": [
+    {
+      "id": 1001,
+      "resource_uri": "/api/v1/meeting/sessionpresentation/1001/",
+      "session": "/api/v1/meeting/session/33406/",
+      "document": "/api/v1/doc/document/agenda-121-vcon/",
+      "rev": "00",
+      "order": 0
+    },
+    {
+      "id": 1002,
+      "resource_uri": "/api/v1/meeting/sessionpresentation/1002/",
+      "session": "/api/v1/meeting/session/33406/",
+      "document": "/api/v1/doc/document/slides-121-vcon-chair-slides/",
+      "rev": "00",
+      "order": 1
+    },
+    {
+      "id": 1003,
+      "resource_uri": "/api/v1/meeting/sessionpresentation/1003/",
+      "session": "/api/v1/meeting/session/33406/",
+      "document": "/api/v1/doc/document/recording-121-vcon-1/",
+      "rev": "00",
+      "order": 2
+    }
+  ]
+}

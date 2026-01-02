@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ietf2vcon"
+version = "0.1.0"
+description = "Convert IETF meeting sessions to vCon format"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "IETF vCon Working Group" }
+]
+keywords = ["ietf", "vcon", "meetings", "transcription"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+    "python-dateutil>=2.8",
+    "yt-dlp>=2024.0.0",
+    "openai-whisper>=20231117",
+    "click>=8.0",
+    "rich>=13.0",
+    "tenacity>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+ietf2vcon = "ietf2vcon.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ietf2vcon"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]

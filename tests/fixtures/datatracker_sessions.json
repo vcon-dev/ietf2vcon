@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "limit": 100,
+    "next": null,
+    "offset": 0,
+    "previous": null,
+    "total_count": 1
+  },
+  "objects": [
+    {
+      "id": 33406,
+      "resource_uri": "/api/v1/meeting/session/33406/",
+      "meeting": "/api/v1/meeting/meeting/2793/",
+      "name": "",
+      "group": "/api/v1/group/group/2383/",
+      "purpose": "/api/v1/name/sessionpurposename/regular/",
+      "type": "/api/v1/name/timeslottypename/regular/",
+      "requested_duration": "01:00:00",
+      "comments": "",
+      "agenda_note": "",
+      "attendees": 50,
+      "scheduled": "2024-11-07T15:30:00",
+      "modified": "2024-11-08T10:00:00"
+    }
+  ]
+}

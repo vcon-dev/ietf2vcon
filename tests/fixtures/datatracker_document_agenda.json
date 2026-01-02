@@ -1,0 +1,10 @@
+{
+  "id": 5001,
+  "resource_uri": "/api/v1/doc/document/agenda-121-vcon/",
+  "name": "agenda-121-vcon",
+  "title": "Agenda for IETF 121 VCON Session",
+  "type": "/api/v1/name/doctypename/agenda/",
+  "rev": "00",
+  "abstract": "",
+  "external_url": "https://datatracker.ietf.org/meeting/121/materials/agenda-121-vcon-00"
+}
