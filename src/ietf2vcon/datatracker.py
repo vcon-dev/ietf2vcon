@@ -170,28 +170,26 @@ class DataTrackerClient:
 
         return sessions
 
-    def get_meeting_sessions(self, meeting_number: int, limit: int = 50) -> list[IETFSession]:
-        """Get sessions for an IETF meeting.
+    def get_meeting_sessions(self, meeting_number: int) -> list[IETFSession]:
+        """Get all sessions for an IETF meeting.
 
         Note: This fetches sessions with minimal detail for listing purposes.
         For full session data, use get_group_sessions with a specific group.
 
         Args:
             meeting_number: IETF meeting number
-            limit: Maximum number of sessions to return (default 50)
         """
         sessions = []
         try:
-            # Get sessions directly - much faster than going through assignments
-            data = self._get(
+            # Get all sessions using pagination
+            all_sessions = self._get_paginated(
                 "/api/v1/meeting/session/",
                 {
                     "meeting__number": meeting_number,
-                    "limit": limit,
                 },
             )
 
-            for session_data in data.get("objects", []):
+            for session_data in all_sessions:
                 session_id = session_data.get("id") or str(session_data.get("pk", ""))
 
                 # Get group info from the URI
