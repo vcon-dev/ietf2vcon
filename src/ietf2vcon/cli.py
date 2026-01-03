@@ -339,6 +339,165 @@ def list_materials(meeting: int, group: str):
         client.close()
 
 
+@main.command("convert-all")
+@click.option(
+    "-m", "--meeting",
+    type=int,
+    required=True,
+    help="IETF meeting number",
+)
+@click.option(
+    "-o", "--output-dir",
+    type=click.Path(path_type=Path),
+    default=Path("./output"),
+    help="Output directory for vCon files",
+)
+@click.option(
+    "--no-transcript",
+    is_flag=True,
+    help="Skip transcript generation",
+)
+@click.option(
+    "--no-video",
+    is_flag=True,
+    help="Skip video references",
+)
+@click.option(
+    "--parallel",
+    type=int,
+    default=1,
+    help="Number of parallel conversions (default: 1)",
+)
+@click.option(
+    "--groups",
+    type=str,
+    multiple=True,
+    help="Only convert specific groups (can specify multiple times)",
+)
+@click.option(
+    "-v", "--verbose",
+    is_flag=True,
+    help="Enable verbose output",
+)
+def convert_all(
+    meeting: int,
+    output_dir: Path,
+    no_transcript: bool,
+    no_video: bool,
+    parallel: int,
+    groups: tuple[str, ...],
+    verbose: bool,
+):
+    """Convert all sessions from an IETF meeting to vCon format.
+
+    Examples:
+
+        # Convert all of IETF 121
+        ietf2vcon convert-all --meeting 121
+
+        # Skip transcripts (faster)
+        ietf2vcon convert-all --meeting 121 --no-transcript
+
+        # Convert in parallel
+        ietf2vcon convert-all --meeting 121 --parallel 4
+
+        # Convert only specific groups
+        ietf2vcon convert-all --meeting 121 --groups vcon --groups httpbis
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+
+    from .datatracker import DataTrackerClient
+
+    setup_logging(verbose)
+
+    console.print(f"\n[bold]Converting IETF {meeting} to vCon[/bold]\n")
+
+    # Get groups to convert
+    if groups:
+        group_list = list(groups)
+        console.print(f"Converting {len(group_list)} specified groups")
+    else:
+        console.print("Fetching session list...")
+        client = DataTrackerClient()
+        try:
+            sessions = client.get_meeting_sessions(meeting)
+            group_list = sorted(set(s.group_acronym for s in sessions))
+        finally:
+            client.close()
+        console.print(f"Found [cyan]{len(group_list)}[/cyan] working groups\n")
+
+    # Configure options
+    options = ConversionOptions(
+        include_video=not no_video,
+        include_transcript=not no_transcript,
+        include_chat=False,
+        output_dir=output_dir,
+    )
+
+    def convert_group(group: str) -> tuple[str, bool, str]:
+        """Convert a single group's session."""
+        try:
+            converter = IETFSessionConverter(options)
+            result = converter.convert_session(meeting, group)
+            if result.errors:
+                return (group, False, result.errors[0])
+            output_path = converter.save_vcon(result)
+            return (group, True, str(output_path))
+        except Exception as e:
+            return (group, False, str(e))
+
+    # Convert sessions
+    results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Converting...", total=len(group_list))
+
+        if parallel > 1:
+            with ThreadPoolExecutor(max_workers=parallel) as executor:
+                futures = {
+                    executor.submit(convert_group, g): g for g in group_list
+                }
+                for future in as_completed(futures):
+                    group = futures[future]
+                    result = future.result()
+                    results.append(result)
+                    progress.update(task, advance=1, description=f"Converted {group}")
+        else:
+            for group in group_list:
+                progress.update(task, description=f"Converting {group}...")
+                result = convert_group(group)
+                results.append(result)
+                progress.update(task, advance=1)
+
+    # Display results
+    console.print("\n")
+
+    table = Table(title=f"IETF {meeting} Conversion Results")
+    table.add_column("Group", style="cyan")
+    table.add_column("Status")
+    table.add_column("Output/Error")
+
+    success_count = 0
+    for group, success, message in sorted(results):
+        if success:
+            success_count += 1
+            table.add_row(group, "[green]✓[/green]", message[:60])
+        else:
+            table.add_row(group, "[red]✗[/red]", message[:60])
+
+    console.print(table)
+    console.print(f"\n[bold]Summary:[/bold] {success_count}/{len(results)} successful")
+
+    if success_count < len(results):
+        sys.exit(1)
+
+
 @main.command()
 @click.argument("vcon_file", type=click.Path(exists=True, path_type=Path))
 def info(vcon_file: Path):

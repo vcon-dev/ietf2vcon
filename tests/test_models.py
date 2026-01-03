@@ -115,14 +115,17 @@ class TestVConModels:
         assert len(dialog.parties) == 2
 
     def test_vcon_attachment_creation(self):
-        """Test creating a VConAttachment."""
+        """Test creating a VConAttachment with external reference."""
         attachment = VConAttachment(
             type="slides",
-            mimetype="application/pdf",
-            url="https://example.com/slides.pdf",
+            body={
+                "url": "https://example.com/slides.pdf",
+                "mimetype": "application/pdf",
+            },
+            encoding="none",
         )
         assert attachment.type == "slides"
-        assert attachment.mimetype == "application/pdf"
+        assert attachment.body["url"] == "https://example.com/slides.pdf"
 
     def test_vcon_attachment_with_body(self):
         """Test VConAttachment with inline body."""

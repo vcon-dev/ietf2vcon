@@ -292,27 +292,43 @@ class VConBuilder:
             material: Material metadata
             content: Optional content bytes (for inline storage)
             inline: If True and content provided, embed content
+
+        Note: Per vCon spec, all attachments must have type, body, and encoding.
+        For external references, we store a reference object in the body.
         """
-        attachment = VConAttachment(
-            type=material.type,
-            mimetype=material.mimetype,
-            filename=material.filename,
-            meta={
-                "title": material.title,
-                "order": material.order,
-            },
-        )
-
         if inline and content:
+            # Inline content - embed as base64
             encoded = base64.b64encode(content).decode("ascii")
-            attachment.body = encoded
-            attachment.encoding = "base64"
-
-            # Add hash for integrity
             hash_value = hashlib.sha256(content).hexdigest()
-            attachment.meta["sha256"] = hash_value
+
+            attachment = VConAttachment(
+                type=material.type,
+                body=encoded,
+                encoding="base64",
+                meta={
+                    "title": material.title,
+                    "order": material.order,
+                    "filename": material.filename,
+                    "mimetype": material.mimetype,
+                    "sha256": hash_value,
+                },
+            )
         else:
-            attachment.url = material.url
+            # External reference - store URL reference in body
+            attachment = VConAttachment(
+                type=material.type,
+                body={
+                    "url": material.url,
+                    "mimetype": material.mimetype,
+                    "filename": material.filename,
+                    "title": material.title,
+                },
+                encoding="none",
+                meta={
+                    "order": material.order,
+                    "external": True,
+                },
+            )
 
         self.vcon.attachments.append(attachment)
         return self

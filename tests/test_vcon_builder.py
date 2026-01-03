@@ -189,8 +189,10 @@ class TestVConBuilderMaterials:
 
         att = next((a for a in vcon.attachments if a.type == "slides"), None)
         assert att is not None
-        assert att.url == "https://example.com/slides.pdf"
-        assert att.meta["title"] == "Test Slides"
+        # URL is now stored in body per vCon spec
+        assert att.body["url"] == "https://example.com/slides.pdf"
+        assert att.body["title"] == "Test Slides"
+        assert att.encoding == "none"
 
     def test_add_materials(self, sample_materials):
         """Test adding multiple materials."""

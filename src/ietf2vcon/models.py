@@ -112,15 +112,18 @@ class VConDialog(BaseModel):
 
 
 class VConAttachment(BaseModel):
-    """An attachment in a vCon."""
+    """An attachment in a vCon.
+
+    Per vCon spec, attachments must have type, body, and encoding.
+    Additional metadata goes in the meta field.
+    """
 
     type: str
-    body: str | dict[str, Any] | None = None
-    encoding: str | None = None
-    url: str | None = None
-    mimetype: str | None = None
-    filename: str | None = None
+    body: str | dict[str, Any]  # Required per spec
+    encoding: str = "none"  # Required per spec: "none", "base64", or "base64url"
     party: int | None = None
+    dialog: int | None = None
+    start: datetime | None = None
     meta: dict[str, Any] | None = None
 
 
