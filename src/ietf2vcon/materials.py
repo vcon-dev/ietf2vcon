@@ -12,6 +12,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .models import IETFMaterial
+from .rsync_mirror import find_local_file
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +20,15 @@ logger = logging.getLogger(__name__)
 class MaterialsDownloader:
     """Download and manage IETF meeting materials."""
 
-    def __init__(self, download_dir: Path | None = None, timeout: float = 60.0):
+    def __init__(
+        self,
+        download_dir: Path | None = None,
+        timeout: float = 60.0,
+        mirror_dir: Path | None = None,
+    ):
         self.download_dir = download_dir or Path("./materials")
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.mirror_dir = mirror_dir
         self.client = httpx.Client(timeout=timeout, follow_redirects=True)
 
     def close(self):
@@ -38,12 +45,38 @@ class MaterialsDownloader:
     def download_material(self, material: IETFMaterial) -> Path | None:
         """Download a single material file.
 
+        Checks the local rsync mirror first if one is configured, falling back
+        to HTTP from the Datatracker.
+
         Args:
             material: The material to download
 
         Returns:
             Path to the downloaded file, or None if failed
         """
+        # Check local rsync mirror first
+        if self.mirror_dir and material.url:
+            doc_name = material.url.rstrip("/").split("/")[-1].split("?")[0]
+            # Extract meeting number from URL if present (e.g. /meeting/125/materials/...)
+            meeting_number = None
+            parts = material.url.split("/")
+            try:
+                idx = parts.index("meeting")
+                meeting_number = int(parts[idx + 1])
+            except (ValueError, IndexError):
+                pass
+
+            if meeting_number:
+                local_path = find_local_file(doc_name, meeting_number, self.mirror_dir)
+                if local_path:
+                    logger.info("Using mirror: %s", local_path)
+                    # Copy to download_dir so callers get a consistent location
+                    dest = self.download_dir / local_path.name
+                    if not dest.exists():
+                        import shutil
+                        shutil.copy2(local_path, dest)
+                    return dest
+
         try:
             logger.info(f"Downloading: {material.title} from {material.url}")
 

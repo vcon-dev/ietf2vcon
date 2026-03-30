@@ -14,6 +14,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .converter import ConversionOptions, IETFSessionConverter
+from .rsync_mirror import sync_proceedings
 
 console = Console()
 
@@ -36,19 +37,22 @@ def main():
     This tool fetches IETF meeting recordings, materials, transcripts,
     and chat logs, combining them into a vCon (Virtual Conversation Container).
 
-    By default, YouTube captions are fetched for the transcript.
+    Transcription backends (in auto priority order):
+      YouTube captions > Meetecho > MLX Whisper > WTF Server > local Whisper
 
     Examples:
 
         # Convert IETF 121 vcon working group session (includes transcript)
         ietf2vcon convert --meeting 121 --group vcon
 
-        # Skip transcript
-        ietf2vcon convert --meeting 121 --group vcon --no-transcript
-
-        # Use Whisper for higher quality transcription
+        # Use MLX Whisper (Apple Silicon) for transcription
         ietf2vcon convert --meeting 121 --group vcon \\
-            --transcript-source whisper --download-video
+            --transcript-source mlx-whisper --mlx-whisper-url http://localhost:8000
+
+        # Use WTF Server with a specific ASR provider
+        ietf2vcon convert --meeting 121 --group vcon \\
+            --transcript-source wtf-server --wtf-server-url http://localhost:3000 \\
+            --wtf-server-provider nvidia
 
         # Include Zulip chat logs
         ietf2vcon convert --meeting 121 --group vcon \\
@@ -120,9 +124,9 @@ def main():
 )
 @click.option(
     "--transcript-source",
-    type=click.Choice(["auto", "youtube", "whisper"]),
+    type=click.Choice(["auto", "youtube", "meetecho", "mlx-whisper", "wtf-server", "whisper"]),
     default="auto",
-    help="Transcript source: auto (YouTube captions first), youtube, or whisper",
+    help="Transcript source: auto tries YouTube > Meetecho > MLX Whisper > WTF Server > local Whisper",
 )
 @click.option(
     "--export-srt",
@@ -141,6 +145,39 @@ def main():
     help="Whisper model size (only used with --transcript-source=whisper)",
 )
 @click.option(
+    "--mlx-whisper-url",
+    type=str,
+    envvar="MLX_WHISPER_URL",
+    help="MLX Whisper sidecar URL (or set MLX_WHISPER_URL env var)",
+)
+@click.option(
+    "--mlx-whisper-model",
+    type=str,
+    envvar="MLX_WHISPER_MODEL",
+    default="mlx-community/whisper-turbo",
+    help="MLX Whisper model name",
+)
+@click.option(
+    "--wtf-server-url",
+    type=str,
+    envvar="WTF_SERVER_URL",
+    help="WTF Server URL (or set WTF_SERVER_URL env var)",
+)
+@click.option(
+    "--wtf-server-provider",
+    type=click.Choice(
+        ["nvidia", "openai", "deepgram", "groq", "local-whisper", "mlx-whisper"]
+    ),
+    envvar="WTF_SERVER_PROVIDER",
+    help="WTF Server ASR provider (or set WTF_SERVER_PROVIDER env var)",
+)
+@click.option(
+    "--wtf-server-model",
+    type=str,
+    envvar="WTF_SERVER_MODEL",
+    help="WTF Server model override",
+)
+@click.option(
     "--no-chat",
     is_flag=True,
     help="Skip Zulip chat logs",
@@ -156,6 +193,13 @@ def main():
     type=str,
     envvar="ZULIP_API_KEY",
     help="Zulip API key (or set ZULIP_API_KEY env var)",
+)
+@click.option(
+    "--rsync-mirror",
+    type=click.Path(path_type=Path),
+    envvar="IETF_RSYNC_MIRROR",
+    help="Local rsync mirror root (checked before HTTP for materials). "
+         "Use 'ietf2vcon sync' to populate it.",
 )
 @click.option(
     "-v", "--verbose",
@@ -178,15 +222,21 @@ def convert(
     export_srt: bool,
     export_webvtt: bool,
     whisper_model: str,
+    mlx_whisper_url: str | None,
+    mlx_whisper_model: str,
+    wtf_server_url: str | None,
+    wtf_server_provider: str | None,
+    wtf_server_model: str | None,
     no_chat: bool,
     zulip_email: str | None,
     zulip_api_key: str | None,
+    rsync_mirror: Path | None,
     verbose: bool,
 ):
     """Convert an IETF session to vCon format.
 
     By default, fetches YouTube captions for the transcript in WTF format.
-    Use --no-transcript to skip, or --transcript-source=whisper for local transcription.
+    Use --no-transcript to skip, or --transcript-source to select a backend.
     Use --export-srt or --export-webvtt to generate subtitle files.
     """
     setup_logging(verbose)
@@ -208,10 +258,16 @@ def convert(
         export_srt=export_srt,
         export_webvtt=export_webvtt,
         whisper_model=whisper_model,
+        mlx_whisper_url=mlx_whisper_url,
+        mlx_whisper_model=mlx_whisper_model,
+        wtf_server_url=wtf_server_url,
+        wtf_server_provider=wtf_server_provider,
+        wtf_server_model=wtf_server_model,
         include_chat=not no_chat,
         zulip_email=zulip_email,
         zulip_api_key=zulip_api_key,
         output_dir=output_dir,
+        rsync_mirror_dir=rsync_mirror,
     )
 
     # Run conversion
@@ -358,6 +414,32 @@ def list_materials(meeting: int, group: str):
     help="Skip transcript generation",
 )
 @click.option(
+    "--transcript-source",
+    type=click.Choice(["auto", "youtube", "meetecho", "mlx-whisper", "wtf-server", "whisper"]),
+    default="auto",
+    help="Transcript source for all sessions",
+)
+@click.option(
+    "--mlx-whisper-url",
+    type=str,
+    envvar="MLX_WHISPER_URL",
+    help="MLX Whisper sidecar URL",
+)
+@click.option(
+    "--wtf-server-url",
+    type=str,
+    envvar="WTF_SERVER_URL",
+    help="WTF Server URL",
+)
+@click.option(
+    "--wtf-server-provider",
+    type=click.Choice(
+        ["nvidia", "openai", "deepgram", "groq", "local-whisper", "mlx-whisper"]
+    ),
+    envvar="WTF_SERVER_PROVIDER",
+    help="WTF Server ASR provider",
+)
+@click.option(
     "--no-video",
     is_flag=True,
     help="Skip video references",
@@ -383,6 +465,10 @@ def convert_all(
     meeting: int,
     output_dir: Path,
     no_transcript: bool,
+    transcript_source: str,
+    mlx_whisper_url: str | None,
+    wtf_server_url: str | None,
+    wtf_server_provider: str | None,
     no_video: bool,
     parallel: int,
     groups: tuple[str, ...],
@@ -397,6 +483,14 @@ def convert_all(
 
         # Skip transcripts (faster)
         ietf2vcon convert-all --meeting 121 --no-transcript
+
+        # Use MLX Whisper for transcription
+        ietf2vcon convert-all --meeting 121 --transcript-source mlx-whisper \\
+            --mlx-whisper-url http://localhost:8000
+
+        # Use WTF Server
+        ietf2vcon convert-all --meeting 121 --transcript-source wtf-server \\
+            --wtf-server-url http://localhost:3000
 
         # Convert in parallel
         ietf2vcon convert-all --meeting 121 --parallel 4
@@ -432,6 +526,10 @@ def convert_all(
     options = ConversionOptions(
         include_video=not no_video,
         include_transcript=not no_transcript,
+        transcription_source=transcript_source,
+        mlx_whisper_url=mlx_whisper_url,
+        wtf_server_url=wtf_server_url,
+        wtf_server_provider=wtf_server_provider,
         include_chat=False,
         output_dir=output_dir,
     )
@@ -538,6 +636,58 @@ def info(vcon_file: Path):
         for i, a in enumerate(attachments):
             atype = a.get("type", "unknown")
             console.print(f"  {i}: {atype}")
+
+
+@main.command()
+@click.option(
+    "-m", "--meeting",
+    type=int,
+    required=True,
+    help="IETF meeting number to sync (e.g., 125)",
+)
+@click.option(
+    "--mirror-dir",
+    type=click.Path(path_type=Path),
+    envvar="IETF_RSYNC_MIRROR",
+    default=Path("./downloads"),
+    help="Local mirror root directory (default: ./downloads)",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would be synced without transferring files",
+)
+def sync(meeting: int, mirror_dir: Path, dry_run: bool):
+    """Sync IETF meeting proceedings from rsync.ietf.org.
+
+    Downloads slides, agendas, minutes, chatlogs, and bluesheets to a local
+    mirror. Subsequent 'convert' runs with --rsync-mirror will use this cache
+    instead of fetching files one-by-one over HTTP.
+
+    Examples:
+
+        # Sync IETF 125 proceedings locally
+        ietf2vcon sync --meeting 125
+
+        # Sync to a custom directory
+        ietf2vcon sync --meeting 125 --mirror-dir /mnt/T9/ietf
+
+        # Preview without downloading
+        ietf2vcon sync --meeting 125 --dry-run
+    """
+    setup_logging(False)
+
+    dest = mirror_dir / "proceedings" / str(meeting)
+    console.print(f"Syncing IETF {meeting} proceedings → {dest}")
+    if dry_run:
+        console.print("[yellow]Dry run — no files will be written[/yellow]")
+
+    ok = sync_proceedings(meeting, mirror_dir, dry_run=dry_run)
+    if ok:
+        console.print(f"[green]✓[/green] Sync complete: {dest}")
+    else:
+        console.print("[red]✗[/red] Sync failed — check rsync is installed and network is available")
+        raise SystemExit(1)
 
 
 def _display_results(result, output_path: Path):
