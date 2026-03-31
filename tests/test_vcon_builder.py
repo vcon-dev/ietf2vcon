@@ -2,11 +2,10 @@
 
 from datetime import datetime
 from pathlib import Path
-from uuid import UUID
 
 import pytest
 
-from ietf2vcon.models import DialogType, IETFMaterial, IETFPerson
+from ietf2vcon.models import IETFMaterial, IETFPerson
 from ietf2vcon.vcon_builder import VConBuilder
 
 
@@ -18,8 +17,7 @@ class TestVConBuilderBasics:
         builder = VConBuilder()
         vcon = builder.build()
 
-        assert isinstance(vcon.uuid, UUID)
-        assert vcon.vcon == "0.0.1"
+        assert isinstance(vcon.uuid, str)
         assert vcon.created_at is not None
 
     def test_set_subject(self):
@@ -49,7 +47,7 @@ class TestVConBuilderParties:
 
         assert idx == 0
         assert len(vcon.parties) == 1
-        assert vcon.parties[0].name == "John Doe"
+        assert vcon.parties[0]["name"] == "John Doe"
 
     def test_add_party_with_email(self):
         """Test adding party with email."""
@@ -61,8 +59,8 @@ class TestVConBuilderParties:
         )
         vcon = builder.build()
 
-        assert vcon.parties[idx].mailto == "jane@example.com"
-        assert vcon.parties[idx].role == "speaker"
+        assert vcon.parties[idx]["mailto"] == "jane@example.com"
+        assert vcon.parties[idx]["role"] == "speaker"
 
     def test_add_party_deduplication(self):
         """Test that duplicate parties are not added."""
@@ -86,8 +84,8 @@ class TestVConBuilderParties:
 
         assert indices == [0, 1]
         assert len(vcon.parties) == 2
-        assert vcon.parties[0].name == "Alice"
-        assert vcon.parties[1].role == "presenter"
+        assert vcon.parties[0]["name"] == "Alice"
+        assert vcon.parties[1]["role"] == "presenter"
 
     def test_add_attendees_party(self):
         """Test adding generic attendees party."""
@@ -95,9 +93,9 @@ class TestVConBuilderParties:
         idx = builder.add_attendees_party(count=50)
         vcon = builder.build()
 
-        assert vcon.parties[idx].name == "IETF Attendees"
-        assert vcon.parties[idx].role == "attendee"
-        assert vcon.parties[idx].meta["count"] == 50
+        assert vcon.parties[idx]["name"] == "IETF Attendees"
+        assert vcon.parties[idx]["role"] == "attendee"
+        assert vcon.parties[idx]["meta"]["count"] == 50
 
 
 class TestVConBuilderMetadata:
@@ -114,11 +112,11 @@ class TestVConBuilderMetadata:
 
         # Check metadata attachment
         metadata_att = next(
-            (a for a in vcon.attachments if a.type == "meeting_metadata"), None
+            (a for a in vcon.attachments if a.get("purpose") == "meeting_metadata"), None
         )
         assert metadata_att is not None
-        assert metadata_att.body["ietf_meeting_number"] == 121
-        assert metadata_att.body["working_group"] == "vcon"
+        assert metadata_att["body"]["ietf_meeting_number"] == 121
+        assert metadata_att["body"]["working_group"] == "vcon"
 
 
 class TestVConBuilderDialogs:
@@ -135,8 +133,8 @@ class TestVConBuilderDialogs:
 
         assert idx == 0
         assert len(vcon.dialog) == 1
-        assert vcon.dialog[0].type == DialogType.VIDEO
-        assert vcon.dialog[0].url == sample_video_metadata.url
+        assert vcon.dialog[0]["type"] == "video"
+        assert vcon.dialog[0]["url"] == sample_video_metadata.url
 
     def test_add_video_dialog_from_url(self, sample_ietf_session):
         """Test adding video dialog from URL."""
@@ -147,8 +145,8 @@ class TestVConBuilderDialogs:
         )
         vcon = builder.build()
 
-        assert vcon.dialog[idx].url == "https://youtube.com/watch?v=abc123"
-        assert vcon.dialog[idx].type == DialogType.VIDEO
+        assert vcon.dialog[idx]["url"] == "https://youtube.com/watch?v=abc123"
+        assert vcon.dialog[idx]["type"] == "video"
 
     def test_add_chat_dialog(self, sample_chat_messages, sample_ietf_session):
         """Test adding chat dialog."""
@@ -159,9 +157,9 @@ class TestVConBuilderDialogs:
         vcon = builder.build()
 
         assert idx == 0
-        assert vcon.dialog[0].type == DialogType.TEXT
-        assert vcon.dialog[0].meta["source"] == "zulip"
-        assert vcon.dialog[0].meta["message_count"] == 2
+        assert vcon.dialog[0]["type"] == "text"
+        assert vcon.dialog[0]["meta"]["source"] == "zulip"
+        assert vcon.dialog[0]["meta"]["message_count"] == 2
 
     def test_add_chat_dialog_empty(self, sample_ietf_session):
         """Test adding empty chat dialog returns -1."""
@@ -187,12 +185,11 @@ class TestVConBuilderMaterials:
         builder.add_material_attachment(material)
         vcon = builder.build()
 
-        att = next((a for a in vcon.attachments if a.type == "slides"), None)
+        att = next((a for a in vcon.attachments if a.get("purpose") == "slides"), None)
         assert att is not None
-        # URL is now stored in body per vCon spec
-        assert att.body["url"] == "https://example.com/slides.pdf"
-        assert att.body["title"] == "Test Slides"
-        assert att.encoding == "none"
+        assert att["body"]["url"] == "https://example.com/slides.pdf"
+        assert att["body"]["title"] == "Test Slides"
+        assert att["encoding"] == "json"
 
     def test_add_materials(self, sample_materials):
         """Test adding multiple materials."""
@@ -201,24 +198,26 @@ class TestVConBuilderMaterials:
         vcon = builder.build()
 
         # Should have agenda, slides, and recording
-        types = [a.type for a in vcon.attachments]
-        assert "agenda" in types
-        assert "slides" in types
-        assert "recording" in types
+        purposes = [a.get("purpose") for a in vcon.attachments]
+        assert "agenda" in purposes
+        assert "slides" in purposes
+        assert "recording" in purposes
 
 
 class TestVConBuilderTranscript:
     """Tests for transcript/analysis in VConBuilder."""
 
     def test_add_transcript(self, sample_transcription_result):
-        """Test adding transcript."""
+        """Test adding transcript as WTF attachment."""
         builder = VConBuilder()
         builder.add_transcript(sample_transcription_result, dialog_index=0)
         vcon = builder.build()
 
-        assert len(vcon.analysis) == 1
-        assert vcon.analysis[0].type == "wtf_transcription"
-        assert vcon.analysis[0].dialog == 0
+        # WTF transcription goes to attachments in vcon-lib
+        wtf_att = next(
+            (a for a in vcon.attachments if a.get("purpose") == "wtf_transcription"), None
+        )
+        assert wtf_att is not None
 
     def test_add_analysis_generic(self):
         """Test adding generic analysis."""
@@ -231,8 +230,8 @@ class TestVConBuilderTranscript:
         )
         vcon = builder.build()
 
-        assert vcon.analysis[0].type == "summary"
-        assert vcon.analysis[0].body == "This is a summary of the meeting."
+        assert vcon.analysis[0]["type"] == "summary"
+        assert vcon.analysis[0]["body"] == "This is a summary of the meeting."
 
 
 class TestVConBuilderLawfulBasis:
@@ -249,11 +248,13 @@ class TestVConBuilderLawfulBasis:
         )
         vcon = builder.build()
 
-        lb_att = next((a for a in vcon.attachments if a.type == "lawful_basis"), None)
+        lb_att = next(
+            (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
+        )
         assert lb_att is not None
-        assert lb_att.body["lawful_basis"] == "consent"
-        assert lb_att.body["jurisdiction"] == "US"
-        assert lb_att.meta["spec"] == "draft-howe-vcon-lawful-basis-00"
+        assert lb_att["body"]["lawful_basis"] == "consent"
+        # Extra fields are in metadata sub-dict per vcon-lib API
+        assert lb_att["body"]["metadata"]["jurisdiction"] == "US"
 
     def test_add_ietf_note_well(self):
         """Test adding IETF Note Well."""
@@ -261,12 +262,14 @@ class TestVConBuilderLawfulBasis:
         builder.add_ietf_note_well()
         vcon = builder.build()
 
-        lb_att = next((a for a in vcon.attachments if a.type == "lawful_basis"), None)
+        lb_att = next(
+            (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
+        )
         assert lb_att is not None
-        assert lb_att.body["lawful_basis"] == "legitimate_interests"
-        assert lb_att.body["terms_of_service"] == "https://www.ietf.org/about/note-well/"
-        assert lb_att.body["terms_of_service_name"] == "IETF Note Well"
-        assert lb_att.body["controller"] == "Internet Engineering Task Force (IETF)"
+        assert lb_att["body"]["lawful_basis"] == "legitimate_interests"
+        assert lb_att["body"]["terms_of_service"] == "https://www.ietf.org/about/note-well/"
+        assert lb_att["body"]["metadata"]["terms_of_service_name"] == "IETF Note Well"
+        assert lb_att["body"]["metadata"]["controller"] == "Internet Engineering Task Force (IETF)"
 
     def test_note_well_purpose_grants(self):
         """Test Note Well includes all required purpose grants."""
@@ -274,8 +277,10 @@ class TestVConBuilderLawfulBasis:
         builder.add_ietf_note_well()
         vcon = builder.build()
 
-        lb_att = next((a for a in vcon.attachments if a.type == "lawful_basis"), None)
-        purposes = [g["purpose"] for g in lb_att.body["purpose_grants"]]
+        lb_att = next(
+            (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
+        )
+        purposes = [g["purpose"] for g in lb_att["body"]["purpose_grants"]]
 
         assert "recording" in purposes
         assert "transcription" in purposes
@@ -297,11 +302,13 @@ class TestVConBuilderIngressInfo:
         )
         vcon = builder.build()
 
-        ing_att = next((a for a in vcon.attachments if a.type == "ingress_info"), None)
+        ing_att = next(
+            (a for a in vcon.attachments if a.get("purpose") == "ingress_info"), None
+        )
         assert ing_att is not None
-        assert ing_att.body["source"] == "ietf2vcon"
-        assert ing_att.body["meeting_number"] == 121
-        assert "converted_at" in ing_att.body
+        assert ing_att["body"]["source"] == "ietf2vcon"
+        assert ing_att["body"]["meeting_number"] == 121
+        assert "converted_at" in ing_att["body"]
 
 
 class TestVConBuilderSerialization:
@@ -313,8 +320,8 @@ class TestVConBuilderSerialization:
         builder.set_subject("Test")
         json_str = builder.to_json()
 
-        assert '"subject": "Test"' in json_str
-        assert '"vcon": "0.0.1"' in json_str
+        assert "Test" in json_str
+        assert "uuid" in json_str
 
     def test_to_dict(self):
         """Test dictionary serialization."""

@@ -5,16 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from ietf2vcon.models import TranscriptSegment
 from ietf2vcon.transcription import (
     MeetechoTranscriptLoader,
+    TranscriptSegment,
     TranscriptionResult,
     YouTubeCaptionLoader,
     _seconds_to_srt_time,
     _seconds_to_webvtt_time,
     transcript_to_srt,
     transcript_to_webvtt,
-    transcription_to_vcon_analysis,
 )
 
 
@@ -43,6 +42,34 @@ class TestTranscriptionResult:
         assert result.duration is None
         assert result.provider == "unknown"
         assert result.model is None
+
+
+class TestTranscriptSegment:
+    """Tests for TranscriptSegment dataclass."""
+
+    def test_segment_creation(self):
+        """Test creating a TranscriptSegment."""
+        segment = TranscriptSegment(
+            id=0,
+            start=0.0,
+            end=5.5,
+            text="Hello world",
+            confidence=0.95,
+        )
+        assert segment.start == 0.0
+        assert segment.end == 5.5
+        assert segment.confidence == 0.95
+
+    def test_segment_with_speaker(self):
+        """Test TranscriptSegment with speaker attribution."""
+        segment = TranscriptSegment(
+            id=1,
+            start=5.5,
+            end=10.0,
+            text="Response text",
+            speaker="speaker_1",
+        )
+        assert segment.speaker == "speaker_1"
 
 
 class TestYouTubeCaptionLoader:
@@ -123,81 +150,6 @@ class TestMeetechoTranscriptLoader:
         """Test parsing invalid timestamp returns 0."""
         loader = MeetechoTranscriptLoader()
         assert loader._parse_timestamp("invalid") == 0.0
-
-
-class TestTranscriptionToVconAnalysis:
-    """Tests for transcription_to_vcon_analysis function."""
-
-    def test_basic_conversion(self, sample_transcription_result):
-        """Test basic conversion to VConAnalysis."""
-        analysis = transcription_to_vcon_analysis(sample_transcription_result)
-
-        assert analysis.type == "wtf_transcription"
-        assert analysis.dialog == 0
-        assert analysis.vendor == "youtube"
-        assert analysis.spec == "draft-howe-wtf-transcription-00"
-
-    def test_wtf_body_structure(self, sample_transcription_result):
-        """Test WTF body has correct structure."""
-        analysis = transcription_to_vcon_analysis(sample_transcription_result)
-        body = analysis.body
-
-        assert "transcript" in body
-        assert "segments" in body
-        assert "metadata" in body
-
-    def test_wtf_transcript_section(self, sample_transcription_result):
-        """Test WTF transcript section content."""
-        analysis = transcription_to_vcon_analysis(sample_transcription_result)
-        transcript = analysis.body["transcript"]
-
-        assert transcript["text"] == sample_transcription_result.text
-        assert transcript["language"] == "en"
-        assert transcript["duration"] == 12.5
-
-    def test_wtf_segments_section(self, sample_transcription_result):
-        """Test WTF segments section content."""
-        analysis = transcription_to_vcon_analysis(sample_transcription_result)
-        segments = analysis.body["segments"]
-
-        assert len(segments) == 3
-        assert segments[0]["id"] == 0
-        assert segments[0]["start"] == 0.0
-        assert segments[0]["end"] == 5.0
-
-    def test_wtf_confidence_included(self, sample_transcription_result):
-        """Test that confidence is included when present."""
-        analysis = transcription_to_vcon_analysis(sample_transcription_result)
-        segments = analysis.body["segments"]
-
-        # Third segment has confidence
-        assert "confidence" in segments[2]
-        assert segments[2]["confidence"] == 0.95
-
-    def test_wtf_confidence_omitted(self, sample_transcription_result):
-        """Test that confidence is omitted when not present."""
-        analysis = transcription_to_vcon_analysis(sample_transcription_result)
-        segments = analysis.body["segments"]
-
-        # First segment has no confidence
-        assert "confidence" not in segments[0]
-
-    def test_wtf_metadata_section(self, sample_transcription_result):
-        """Test WTF metadata section content."""
-        analysis = transcription_to_vcon_analysis(sample_transcription_result)
-        metadata = analysis.body["metadata"]
-
-        assert metadata["provider"] == "youtube"
-        assert metadata["model"] == "auto-generated"
-        assert metadata["segment_count"] == 3
-        assert "created_at" in metadata
-
-    def test_custom_dialog_index(self, sample_transcription_result):
-        """Test setting custom dialog index."""
-        analysis = transcription_to_vcon_analysis(
-            sample_transcription_result, dialog_index=2
-        )
-        assert analysis.dialog == 2
 
 
 class TestTranscriptToSRT:

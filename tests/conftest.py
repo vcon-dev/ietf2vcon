@@ -99,7 +99,7 @@ def sample_ietf_session():
 @pytest.fixture
 def sample_transcript_segments():
     """Create sample transcript segments."""
-    from ietf2vcon.models import TranscriptSegment
+    from ietf2vcon.transcription import TranscriptSegment
 
     return [
         TranscriptSegment(id=0, start=0.0, end=5.0, text="Welcome to the session."),

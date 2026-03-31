@@ -38,6 +38,28 @@ class TestConversionOptions:
         assert options.output_dir == tmp_path
         assert options.whisper_model == "large"
 
+    def test_new_backend_options(self):
+        """Test new transcription backend options."""
+        options = ConversionOptions(
+            transcription_source="mlx-whisper",
+            mlx_whisper_url="http://localhost:8000",
+            mlx_whisper_model="mlx-community/whisper-turbo",
+        )
+        assert options.transcription_source == "mlx-whisper"
+        assert options.mlx_whisper_url == "http://localhost:8000"
+        assert options.mlx_whisper_model == "mlx-community/whisper-turbo"
+
+    def test_wtf_server_options(self):
+        """Test WTF Server backend options."""
+        options = ConversionOptions(
+            transcription_source="wtf-server",
+            wtf_server_url="http://localhost:3000",
+            wtf_server_provider="nvidia",
+        )
+        assert options.transcription_source == "wtf-server"
+        assert options.wtf_server_url == "http://localhost:3000"
+        assert options.wtf_server_provider == "nvidia"
+
 
 class TestConversionResult:
     """Tests for ConversionResult dataclass."""
@@ -128,12 +150,12 @@ class TestIETFSessionConverter:
         result = converter.convert_session(121, "vcon")
         vcon = result.vcon
 
-        # Find lawful_basis attachment
+        # Find lawful_basis attachment (vcon-lib uses "purpose" key)
         lb_att = next(
-            (a for a in vcon.attachments if a.type == "lawful_basis"), None
+            (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
         )
         assert lb_att is not None
-        assert lb_att.body["terms_of_service_name"] == "IETF Note Well"
+        assert lb_att["body"]["metadata"]["terms_of_service_name"] == "IETF Note Well"
 
     def test_convert_session_adds_ingress_info(
         self, converter, mock_datatracker, sample_ietf_meeting, sample_ietf_session
@@ -143,11 +165,11 @@ class TestIETFSessionConverter:
         vcon = result.vcon
 
         ing_att = next(
-            (a for a in vcon.attachments if a.type == "ingress_info"), None
+            (a for a in vcon.attachments if a.get("purpose") == "ingress_info"), None
         )
         assert ing_att is not None
-        assert ing_att.body["source"] == "ietf2vcon"
-        assert ing_att.body["meeting_number"] == 121
+        assert ing_att["body"]["source"] == "ietf2vcon"
+        assert ing_att["body"]["meeting_number"] == 121
 
     def test_convert_session_with_materials(
         self,
@@ -185,7 +207,7 @@ class TestIETFSessionConverter:
         with open(output_path) as f:
             data = json.load(f)
         assert "uuid" in data
-        assert "vcon" in data
+        assert "parties" in data
 
     def test_save_vcon_custom_path(self, converter, mock_datatracker, tmp_path):
         """Test saving vCon to custom path."""

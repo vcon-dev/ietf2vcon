@@ -1,20 +1,37 @@
 """Transcription services for IETF session audio/video.
 
 Supports multiple transcription backends:
-- OpenAI Whisper (local)
+- OpenAI Whisper (local, optional dependency)
+- MLX Whisper (Apple Silicon, via vcon-mac-wtf sidecar)
+- WTF Server (multi-provider REST API)
+- YouTube captions (pre-generated)
 - Meetecho pre-generated transcripts
 """
 
+import base64
 import json
 import logging
+import math
+import mimetypes
 import subprocess
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .models import TranscriptSegment, VConAnalysis
+import httpx
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TranscriptSegment:
+    """A single segment of a transcript."""
+
+    start: float
+    end: float
+    text: str
+    id: int | None = None
+    speaker: str | None = None
+    confidence: float | None = None
 
 
 @dataclass
@@ -29,15 +46,266 @@ class TranscriptionResult:
     model: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Server-based transcription backends
+# ---------------------------------------------------------------------------
+
+
+class MlxWhisperTranscriber:
+    """Transcribe audio via MLX Whisper (Apple Silicon).
+
+    Connects to the vcon-mac-wtf Python sidecar running an OpenAI-compatible
+    transcription API at ``/v1/audio/transcriptions``.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        model: str = "mlx-community/whisper-turbo",
+        timeout: float = 600.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+
+    def is_available(self) -> bool:
+        """Check if the MLX Whisper sidecar is reachable."""
+        for path in ("/health", "/v1/models"):
+            try:
+                resp = httpx.get(f"{self.base_url}{path}", timeout=5.0)
+                if resp.status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                continue
+        return False
+
+    def transcribe(self, audio_path: Path) -> TranscriptionResult | None:
+        """Transcribe an audio file via MLX Whisper.
+
+        Sends the audio as multipart form data and requests verbose_json
+        with word + segment timestamp granularities.
+        """
+        try:
+            content_type = _guess_content_type(audio_path)
+
+            with open(audio_path, "rb") as f:
+                audio_data = f.read()
+
+            logger.info(
+                "Starting MLX Whisper transcription: %s (%d bytes)",
+                audio_path.name,
+                len(audio_data),
+            )
+
+            files = {"file": (audio_path.name, audio_data, content_type)}
+            data = {
+                "model": self.model,
+                "response_format": "verbose_json",
+                "timestamp_granularities[]": ["word", "segment"],
+            }
+
+            resp = httpx.post(
+                f"{self.base_url}/v1/audio/transcriptions",
+                files=files,
+                data=data,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            logger.info(
+                "MLX Whisper transcription completed: duration=%.1fs, text_length=%d",
+                result.get("duration", 0),
+                len(result.get("text", "")),
+            )
+
+            return self._parse_verbose_json(result)
+
+        except Exception as e:
+            logger.error("MLX Whisper transcription failed: %s", e)
+            return None
+
+    def _parse_verbose_json(self, data: dict) -> TranscriptionResult:
+        """Parse an OpenAI-style verbose_json response."""
+        segments = []
+        for i, seg in enumerate(data.get("segments", [])):
+            confidence = 0.95
+            if seg.get("avg_logprob") is not None:
+                confidence = min(math.exp(seg["avg_logprob"]), 1.0)
+
+            segments.append(
+                TranscriptSegment(
+                    id=i,
+                    start=seg["start"],
+                    end=seg["end"],
+                    text=seg["text"].strip(),
+                    confidence=confidence,
+                )
+            )
+
+        return TranscriptionResult(
+            text=data.get("text", "").strip(),
+            segments=segments,
+            language=data.get("language"),
+            duration=data.get("duration"),
+            provider="mlx-whisper",
+            model=self.model,
+        )
+
+
+class WtfServerTranscriber:
+    """Transcribe audio via the WTF Server REST API.
+
+    Builds a minimal vCon with base64url-encoded audio, POSTs it to the
+    server's ``/transcribe`` endpoint, and extracts the WTF analysis from
+    the enriched vCon response.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:3000",
+        provider: str | None = None,
+        model: str | None = None,
+        timeout: float = 600.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.provider = provider
+        self.model = model
+        self.timeout = timeout
+
+    def is_available(self) -> bool:
+        """Check if the WTF Server is reachable."""
+        try:
+            resp = httpx.get(f"{self.base_url}/health", timeout=5.0)
+            if resp.status_code == 200:
+                body = resp.json()
+                return body.get("status") == "ok"
+        except httpx.HTTPError:
+            pass
+        return False
+
+    def transcribe(self, audio_path: Path) -> TranscriptionResult | None:
+        """Transcribe an audio file via the WTF Server.
+
+        Wraps the audio in a minimal vCon and POSTs to ``/transcribe``.
+        The server returns an enriched vCon with WTF analysis attached.
+        """
+        try:
+            content_type = _guess_content_type(audio_path)
+
+            with open(audio_path, "rb") as f:
+                audio_data = f.read()
+
+            encoded = base64.urlsafe_b64encode(audio_data).decode("ascii")
+
+            logger.info(
+                "Starting WTF Server transcription: %s (%d bytes, provider=%s)",
+                audio_path.name,
+                len(audio_data),
+                self.provider or "default",
+            )
+
+            # Build minimal vCon with inline audio
+            vcon_payload = {
+                "vcon": "0.0.1",
+                "parties": [{"name": "speaker"}],
+                "dialog": [
+                    {
+                        "type": "recording",
+                        "start": "2024-01-01T00:00:00Z",
+                        "parties": [0],
+                        "mediatype": content_type,
+                        "body": encoded,
+                        "encoding": "base64url",
+                    }
+                ],
+                "analysis": [],
+                "attachments": [],
+            }
+
+            # Build query params for provider/model selection
+            params = {}
+            if self.provider:
+                params["provider"] = self.provider
+            if self.model:
+                params["model"] = self.model
+
+            resp = httpx.post(
+                f"{self.base_url}/transcribe",
+                json=vcon_payload,
+                params=params,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            enriched = resp.json()
+
+            provider_header = resp.headers.get("X-Provider", self.provider or "wtf-server")
+            model_header = resp.headers.get("X-Model")
+
+            return self._extract_transcription(enriched, provider_header, model_header)
+
+        except Exception as e:
+            logger.error("WTF Server transcription failed: %s", e)
+            return None
+
+    def _extract_transcription(
+        self,
+        vcon_data: dict,
+        provider: str,
+        model: str | None,
+    ) -> TranscriptionResult | None:
+        """Extract TranscriptionResult from an enriched vCon response.
+
+        Looks for WTF transcription analysis in the response.
+        """
+        for analysis in vcon_data.get("analysis", []):
+            if analysis.get("type") != "wtf_transcription":
+                continue
+
+            body = analysis.get("body", {})
+            if isinstance(body, str):
+                body = json.loads(body)
+
+            transcript = body.get("transcript", {})
+            raw_segments = body.get("segments", [])
+
+            segments = []
+            for i, seg in enumerate(raw_segments):
+                segments.append(
+                    TranscriptSegment(
+                        id=seg.get("id", i),
+                        start=seg["start"],
+                        end=seg["end"],
+                        text=seg["text"],
+                        speaker=seg.get("speaker"),
+                        confidence=seg.get("confidence"),
+                    )
+                )
+
+            metadata = body.get("metadata", {})
+
+            return TranscriptionResult(
+                text=transcript.get("text", ""),
+                segments=segments,
+                language=transcript.get("language"),
+                duration=transcript.get("duration"),
+                provider=metadata.get("provider", provider),
+                model=metadata.get("model", model),
+            )
+
+        logger.warning("No WTF transcription analysis found in server response")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Local transcription backends
+# ---------------------------------------------------------------------------
+
+
 class WhisperTranscriber:
-    """Transcribe audio using OpenAI Whisper."""
+    """Transcribe audio using OpenAI Whisper (local, optional dependency)."""
 
     def __init__(self, model: str = "base"):
-        """Initialize Whisper transcriber.
-
-        Args:
-            model: Whisper model size (tiny, base, small, medium, large)
-        """
         self.model = model
         self._whisper = None
 
@@ -49,25 +317,18 @@ class WhisperTranscriber:
                 self._whisper = whisper
             except ImportError:
                 raise ImportError(
-                    "whisper not installed. Install with: pip install openai-whisper"
+                    "whisper not installed. Install with: pip install ietf2vcon[whisper]"
                 )
         return self._whisper
 
     def transcribe(self, audio_path: Path) -> TranscriptionResult | None:
-        """Transcribe an audio file using Whisper.
-
-        Args:
-            audio_path: Path to audio file
-
-        Returns:
-            TranscriptionResult or None if failed
-        """
+        """Transcribe an audio file using local Whisper."""
         try:
             whisper = self._load_whisper()
-            logger.info(f"Loading Whisper model: {self.model}")
+            logger.info("Loading Whisper model: %s", self.model)
             model = whisper.load_model(self.model)
 
-            logger.info(f"Transcribing: {audio_path}")
+            logger.info("Transcribing: %s", audio_path)
             result = model.transcribe(str(audio_path))
 
             segments = []
@@ -91,18 +352,11 @@ class WhisperTranscriber:
             )
 
         except Exception as e:
-            logger.error(f"Whisper transcription failed: {e}")
+            logger.error("Whisper transcription failed: %s", e)
             return None
 
     def transcribe_with_cli(self, audio_path: Path) -> TranscriptionResult | None:
-        """Transcribe using whisper CLI (alternative to Python API).
-
-        Args:
-            audio_path: Path to audio file
-
-        Returns:
-            TranscriptionResult or None if failed
-        """
+        """Transcribe using whisper CLI (alternative to Python API)."""
         try:
             output_dir = audio_path.parent
             output_base = audio_path.stem
@@ -117,17 +371,16 @@ class WhisperTranscriber:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=3600,  # 1 hour timeout
+                timeout=3600,
             )
 
             if result.returncode != 0:
-                logger.error(f"Whisper CLI failed: {result.stderr}")
+                logger.error("Whisper CLI failed: %s", result.stderr)
                 return None
 
-            # Load the JSON output
             json_path = output_dir / f"{output_base}.json"
             if not json_path.exists():
-                logger.error(f"Whisper output not found: {json_path}")
+                logger.error("Whisper output not found: %s", json_path)
                 return None
 
             with open(json_path) as f:
@@ -155,23 +408,21 @@ class WhisperTranscriber:
         except subprocess.TimeoutExpired:
             logger.error("Whisper CLI timed out")
         except Exception as e:
-            logger.error(f"Whisper CLI failed: {e}")
+            logger.error("Whisper CLI failed: %s", e)
 
         return None
+
+
+# ---------------------------------------------------------------------------
+# Pre-generated transcript loaders
+# ---------------------------------------------------------------------------
 
 
 class YouTubeCaptionLoader:
     """Load transcripts from YouTube caption files (JSON3 format)."""
 
     def load_captions(self, caption_path: Path) -> TranscriptionResult | None:
-        """Load a YouTube JSON3 caption file.
-
-        Args:
-            caption_path: Path to the JSON3 caption file
-
-        Returns:
-            TranscriptionResult or None if failed
-        """
+        """Load a YouTube JSON3 caption file."""
         try:
             with open(caption_path) as f:
                 data = json.load(f)
@@ -179,23 +430,19 @@ class YouTubeCaptionLoader:
             segments = []
             full_text = []
 
-            # JSON3 format has "events" array with caption segments
             events = data.get("events", [])
 
             segment_id = 0
             for event in events:
-                # Skip non-caption events (like style events)
                 if "segs" not in event:
                     continue
 
-                # Get timing info (in milliseconds)
                 start_ms = event.get("tStartMs", 0)
                 duration_ms = event.get("dDurationMs", 0)
 
                 start_sec = start_ms / 1000.0
                 end_sec = (start_ms + duration_ms) / 1000.0
 
-                # Combine all segments in this event
                 text_parts = []
                 for seg in event.get("segs", []):
                     text = seg.get("utf8", "")
@@ -220,20 +467,19 @@ class YouTubeCaptionLoader:
                 logger.warning("No caption segments found in file")
                 return None
 
-            # Calculate duration from last segment
             duration = segments[-1].end if segments else None
 
             return TranscriptionResult(
                 text=" ".join(full_text),
                 segments=segments,
-                language="en",  # YouTube captions are typically auto-detected
+                language="en",
                 duration=duration,
                 provider="youtube",
                 model="auto-generated",
             )
 
         except Exception as e:
-            logger.error(f"Failed to load YouTube captions: {e}")
+            logger.error("Failed to load YouTube captions: %s", e)
             return None
 
 
@@ -241,29 +487,20 @@ class MeetechoTranscriptLoader:
     """Load pre-generated transcripts from Meetecho recording player format."""
 
     def load_transcript(self, transcript_path: Path) -> TranscriptionResult | None:
-        """Load a Meetecho transcript JSON file.
-
-        Args:
-            transcript_path: Path to transcript JSON
-
-        Returns:
-            TranscriptionResult or None if failed
-        """
+        """Load a Meetecho transcript JSON file."""
         try:
             with open(transcript_path) as f:
                 data = json.load(f)
 
-            # Meetecho format has segments with timestamps
             segments = []
             full_text = []
 
             for i, entry in enumerate(data.get("entries", data.get("transcript", []))):
                 text = entry.get("text", entry.get("content", ""))
                 start = entry.get("start", entry.get("timestamp", 0))
-                end = entry.get("end", start + 5)  # Default 5 second segments
+                end = entry.get("end", start + 5)
 
                 if isinstance(start, str):
-                    # Parse timestamp string (e.g., "00:01:23")
                     start = self._parse_timestamp(start)
                 if isinstance(end, str):
                     end = self._parse_timestamp(end)
@@ -286,7 +523,7 @@ class MeetechoTranscriptLoader:
             )
 
         except Exception as e:
-            logger.error(f"Failed to load Meetecho transcript: {e}")
+            logger.error("Failed to load Meetecho transcript: %s", e)
             return None
 
     def _parse_timestamp(self, ts: str) -> float:
@@ -305,106 +542,32 @@ class MeetechoTranscriptLoader:
             return 0.0
 
 
-def transcription_to_vcon_analysis(
-    result: TranscriptionResult,
-    dialog_index: int = 0,
-) -> VConAnalysis:
-    """Convert a TranscriptionResult to vCon WTF (World Transcription Format) analysis.
-
-    The WTF extension provides a standardized format for transcriptions with:
-    - Full transcript text with language detection
-    - Time-aligned segments with optional speaker attribution
-    - Confidence scores at segment and transcript level
-    - Metadata about the transcription provider/model
-
-    Args:
-        result: Transcription result
-        dialog_index: Index of the dialog this transcript belongs to
-
-    Returns:
-        VConAnalysis object in WTF format
-    """
-    # Calculate average confidence if segments have confidence scores
-    confidences = [seg.confidence for seg in result.segments if seg.confidence is not None]
-    avg_confidence = sum(confidences) / len(confidences) if confidences else None
-
-    # Build WTF (World Transcription Format) body
-    # Following draft-howe-wtf-transcription
-    wtf_body = {
-        "transcript": {
-            "text": result.text,
-            "language": result.language or "en",
-            "duration": result.duration,
-            "confidence": avg_confidence,
-        },
-        "segments": [
-            {
-                "id": seg.id if seg.id is not None else i,
-                "start": round(seg.start, 3),
-                "end": round(seg.end, 3),
-                "text": seg.text,
-                # Only include speaker if present (party index in vCon)
-                **({"speaker": seg.speaker} if seg.speaker is not None else {}),
-                # Only include confidence if present
-                **({"confidence": round(seg.confidence, 4)} if seg.confidence is not None else {}),
-            }
-            for i, seg in enumerate(result.segments)
-        ],
-        "metadata": {
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "provider": result.provider,
-            "model": result.model,
-            "segment_count": len(result.segments),
-        },
-    }
-
-    return VConAnalysis(
-        type="wtf_transcription",  # WTF extension type
-        dialog=dialog_index,
-        vendor=result.provider,
-        spec="draft-howe-wtf-transcription-00",  # Explicit draft reference for traceability
-        body=wtf_body,
-        encoding="none",
-    )
+# ---------------------------------------------------------------------------
+# Subtitle export helpers
+# ---------------------------------------------------------------------------
 
 
 def transcript_to_srt(result: TranscriptionResult) -> str:
-    """Convert a TranscriptionResult to SRT subtitle format.
-
-    Args:
-        result: Transcription result
-
-    Returns:
-        SRT formatted string
-    """
+    """Convert a TranscriptionResult to SRT subtitle format."""
     lines = []
 
     for i, seg in enumerate(result.segments, 1):
-        # SRT uses comma for milliseconds
         start_time = _seconds_to_srt_time(seg.start)
         end_time = _seconds_to_srt_time(seg.end)
 
         lines.append(str(i))
         lines.append(f"{start_time} --> {end_time}")
         lines.append(seg.text)
-        lines.append("")  # Empty line between entries
+        lines.append("")
 
     return "\n".join(lines)
 
 
 def transcript_to_webvtt(result: TranscriptionResult) -> str:
-    """Convert a TranscriptionResult to WebVTT subtitle format.
-
-    Args:
-        result: Transcription result
-
-    Returns:
-        WebVTT formatted string
-    """
+    """Convert a TranscriptionResult to WebVTT subtitle format."""
     lines = ["WEBVTT", ""]
 
     for i, seg in enumerate(result.segments, 1):
-        # WebVTT uses period for milliseconds
         start_time = _seconds_to_webvtt_time(seg.start)
         end_time = _seconds_to_webvtt_time(seg.end)
 
@@ -414,6 +577,47 @@ def transcript_to_webvtt(result: TranscriptionResult) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Backend availability
+# ---------------------------------------------------------------------------
+
+
+def check_backend_availability(
+    mlx_whisper_url: str | None = None,
+    wtf_server_url: str | None = None,
+) -> dict[str, bool]:
+    """Probe configured transcription backends and return availability."""
+    availability: dict[str, bool] = {}
+
+    if mlx_whisper_url:
+        t = MlxWhisperTranscriber(base_url=mlx_whisper_url)
+        availability["mlx-whisper"] = t.is_available()
+
+    if wtf_server_url:
+        t = WtfServerTranscriber(base_url=wtf_server_url)
+        availability["wtf-server"] = t.is_available()
+
+    # Local whisper: check if the package is importable
+    try:
+        import whisper  # noqa: F401
+        availability["whisper"] = True
+    except ImportError:
+        availability["whisper"] = False
+
+    return availability
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _guess_content_type(audio_path: Path) -> str:
+    """Guess the MIME type for an audio file."""
+    mime, _ = mimetypes.guess_type(str(audio_path))
+    return mime or "audio/wav"
 
 
 def _seconds_to_srt_time(seconds: float) -> str:
