@@ -1,0 +1,368 @@
+{
+  "schema_version": "1.0.0",
+  "repo": "ietf2vcon",
+  "repo_version": "0.1.0",
+  "archetype": "python-library",
+  "generated_at": "2026-04-16T15:15:44.927007+00:00",
+  "stats": {
+    "node_count": 48,
+    "edge_count": 5
+  },
+  "nodes": [
+    {
+      "id": "dependency:vcon",
+      "type": "dependency",
+      "name": "vcon",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "dependency:httpx",
+      "type": "dependency",
+      "name": "httpx",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "dependency:pydantic",
+      "type": "dependency",
+      "name": "pydantic",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "dependency:python-dateutil",
+      "type": "dependency",
+      "name": "python-dateutil",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "dependency:yt-dlp",
+      "type": "dependency",
+      "name": "yt-dlp",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "dependency:click",
+      "type": "dependency",
+      "name": "click",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "dependency:rich",
+      "type": "dependency",
+      "name": "rich",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "dependency:tenacity",
+      "type": "dependency",
+      "name": "tenacity",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "function:setup_logging",
+      "type": "function",
+      "name": "setup_logging",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 22
+    },
+    {
+      "id": "function:main",
+      "type": "function",
+      "name": "main",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 34
+    },
+    {
+      "id": "function:convert",
+      "type": "function",
+      "name": "convert",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 209
+    },
+    {
+      "id": "function:list_sessions",
+      "type": "function",
+      "name": "list_sessions",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 308
+    },
+    {
+      "id": "function:list_materials",
+      "type": "function",
+      "name": "list_materials",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 364
+    },
+    {
+      "id": "function:convert_all",
+      "type": "function",
+      "name": "convert_all",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 464
+    },
+    {
+      "id": "function:info",
+      "type": "function",
+      "name": "info",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 601
+    },
+    {
+      "id": "function:sync",
+      "type": "function",
+      "name": "sync",
+      "file": "src/ietf2vcon/cli.py",
+      "line": 660
+    },
+    {
+      "id": "class:ConversionOptions",
+      "type": "class",
+      "name": "ConversionOptions",
+      "file": "src/ietf2vcon/converter.py",
+      "line": 37
+    },
+    {
+      "id": "class:ConversionResult",
+      "type": "class",
+      "name": "ConversionResult",
+      "file": "src/ietf2vcon/converter.py",
+      "line": 82
+    },
+    {
+      "id": "class:IETFSessionConverter",
+      "type": "class",
+      "name": "IETFSessionConverter",
+      "file": "src/ietf2vcon/converter.py",
+      "line": 97
+    },
+    {
+      "id": "class:DataTrackerClient",
+      "type": "class",
+      "name": "DataTrackerClient",
+      "file": "src/ietf2vcon/datatracker.py",
+      "line": 23
+    },
+    {
+      "id": "class:MaterialsDownloader",
+      "type": "class",
+      "name": "MaterialsDownloader",
+      "file": "src/ietf2vcon/materials.py",
+      "line": 20
+    },
+    {
+      "id": "function:organize_materials_by_type",
+      "type": "function",
+      "name": "organize_materials_by_type",
+      "file": "src/ietf2vcon/materials.py",
+      "line": 188
+    },
+    {
+      "id": "class:IETFMeeting",
+      "type": "class",
+      "name": "IETFMeeting",
+      "file": "src/ietf2vcon/models.py",
+      "line": 17
+    },
+    {
+      "id": "class:IETFSession",
+      "type": "class",
+      "name": "IETFSession",
+      "file": "src/ietf2vcon/models.py",
+      "line": 28
+    },
+    {
+      "id": "class:IETFMaterial",
+      "type": "class",
+      "name": "IETFMaterial",
+      "file": "src/ietf2vcon/models.py",
+      "line": 46
+    },
+    {
+      "id": "class:IETFPerson",
+      "type": "class",
+      "name": "IETFPerson",
+      "file": "src/ietf2vcon/models.py",
+      "line": 57
+    },
+    {
+      "id": "class:ChatMessage",
+      "type": "class",
+      "name": "ChatMessage",
+      "file": "src/ietf2vcon/models.py",
+      "line": 69
+    },
+    {
+      "id": "function:sync_proceedings",
+      "type": "function",
+      "name": "sync_proceedings",
+      "file": "src/ietf2vcon/rsync_mirror.py",
+      "line": 27
+    },
+    {
+      "id": "function:find_local_file",
+      "type": "function",
+      "name": "find_local_file",
+      "file": "src/ietf2vcon/rsync_mirror.py",
+      "line": 65
+    },
+    {
+      "id": "function:mirror_available",
+      "type": "function",
+      "name": "mirror_available",
+      "file": "src/ietf2vcon/rsync_mirror.py",
+      "line": 119
+    },
+    {
+      "id": "class:TranscriptSegment",
+      "type": "class",
+      "name": "TranscriptSegment",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 26
+    },
+    {
+      "id": "class:TranscriptionResult",
+      "type": "class",
+      "name": "TranscriptionResult",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 38
+    },
+    {
+      "id": "class:MlxWhisperTranscriber",
+      "type": "class",
+      "name": "MlxWhisperTranscriber",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 54
+    },
+    {
+      "id": "class:WtfServerTranscriber",
+      "type": "class",
+      "name": "WtfServerTranscriber",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 156
+    },
+    {
+      "id": "class:WhisperTranscriber",
+      "type": "class",
+      "name": "WhisperTranscriber",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 305
+    },
+    {
+      "id": "class:YouTubeCaptionLoader",
+      "type": "class",
+      "name": "YouTubeCaptionLoader",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 421
+    },
+    {
+      "id": "class:MeetechoTranscriptLoader",
+      "type": "class",
+      "name": "MeetechoTranscriptLoader",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 486
+    },
+    {
+      "id": "function:transcript_to_srt",
+      "type": "function",
+      "name": "transcript_to_srt",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 550
+    },
+    {
+      "id": "function:transcript_to_webvtt",
+      "type": "function",
+      "name": "transcript_to_webvtt",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 566
+    },
+    {
+      "id": "function:check_backend_availability",
+      "type": "function",
+      "name": "check_backend_availability",
+      "file": "src/ietf2vcon/transcription.py",
+      "line": 587
+    },
+    {
+      "id": "class:VConBuilder",
+      "type": "class",
+      "name": "VConBuilder",
+      "file": "src/ietf2vcon/vcon_builder.py",
+      "line": 33
+    },
+    {
+      "id": "class:VideoMetadata",
+      "type": "class",
+      "name": "VideoMetadata",
+      "file": "src/ietf2vcon/youtube.py",
+      "line": 20
+    },
+    {
+      "id": "class:YouTubeResolver",
+      "type": "class",
+      "name": "YouTubeResolver",
+      "file": "src/ietf2vcon/youtube.py",
+      "line": 32
+    },
+    {
+      "id": "class:ZulipClient",
+      "type": "class",
+      "name": "ZulipClient",
+      "file": "src/ietf2vcon/zulip_client.py",
+      "line": 21
+    },
+    {
+      "id": "function:chat_messages_to_text",
+      "type": "function",
+      "name": "chat_messages_to_text",
+      "file": "src/ietf2vcon/zulip_client.py",
+      "line": 240
+    },
+    {
+      "id": "function:chat_messages_to_json",
+      "type": "function",
+      "name": "chat_messages_to_json",
+      "file": "src/ietf2vcon/zulip_client.py",
+      "line": 257
+    },
+    {
+      "id": "interface:ietf2vcon",
+      "type": "interface",
+      "name": "ietf2vcon",
+      "description": "CLI: ietf2vcon.cli:main",
+      "file": "pyproject.toml"
+    },
+    {
+      "id": "document:readme-md",
+      "type": "document",
+      "name": "README.md",
+      "file": "README.md"
+    }
+  ],
+  "edges": [
+    {
+      "from": "class:IETFMeeting",
+      "to": "class:BaseModel",
+      "type": "inherits"
+    },
+    {
+      "from": "class:IETFSession",
+      "to": "class:BaseModel",
+      "type": "inherits"
+    },
+    {
+      "from": "class:IETFMaterial",
+      "to": "class:BaseModel",
+      "type": "inherits"
+    },
+    {
+      "from": "class:IETFPerson",
+      "to": "class:BaseModel",
+      "type": "inherits"
+    },
+    {
+      "from": "class:ChatMessage",
+      "to": "class:BaseModel",
+      "type": "inherits"
+    }
+  ],
+  "subsystems": []
+}
