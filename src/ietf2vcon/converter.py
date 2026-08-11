@@ -477,7 +477,9 @@ class IETFSessionConverter:
         self, session: IETFSession, video_url: str | None
     ) -> TranscriptionResult | None:
         """Try loading YouTube auto-generated captions."""
-        if not video_url or "youtube.com" not in video_url:
+        if not video_url or not any(
+            host in video_url for host in ("youtube.com", "youtu.be")
+        ):
             return None
 
         youtube = YouTubeResolver(download_dir=self.options.output_dir / "videos")
