@@ -182,16 +182,34 @@ class IETFSessionConverter:
             # Fetch materials first to extract recording URL
             materials = []
             recording_url = None
+            recording_mediatype = "video/mp4"
             if self.options.include_materials or self.options.include_video:
                 try:
                     materials = datatracker.get_session_materials(
                         meeting_number, group_acronym
                     )
+                    # Prefer video: meetings from roughly IETF 95 on publish a
+                    # YouTube recording, but IETF 90-94 have only the audio MP3
+                    # on ietf.org, and several later meetings carry both.
+                    audio_url = None
                     for mat in materials:
-                        if mat.type == "recording" and mat.url:
-                            if "youtube.com" in mat.url or "youtu.be" in mat.url:
-                                recording_url = mat.url
-                                break
+                        if mat.type != "recording" or not mat.url:
+                            continue
+                        if "youtube.com" in mat.url or "youtu.be" in mat.url:
+                            recording_url = mat.url
+                            break
+                        if mat.url.lower().endswith(".mp3"):
+                            # The Datatracker lists some audio twice, as http
+                            # and https. The spec requires HTTPS for externally
+                            # referenced files, so take that variant.
+                            if audio_url is None or (
+                                audio_url.startswith("http://")
+                                and mat.url.startswith("https://")
+                            ):
+                                audio_url = mat.url
+                    if recording_url is None and audio_url:
+                        recording_url = audio_url
+                        recording_mediatype = "audio/mpeg"
                 except Exception as e:
                     logger.warning("Failed to fetch materials: %s", e)
 
@@ -200,7 +218,12 @@ class IETFSessionConverter:
             video_dialog_index = -1
             if self.options.include_video:
                 video_url, video_dialog_index = self._process_video(
-                    builder, session, errors, warnings, recording_url=recording_url
+                    builder,
+                    session,
+                    errors,
+                    warnings,
+                    recording_url=recording_url,
+                    recording_mediatype=recording_mediatype,
                 )
 
             # Process materials (excluding recordings which are now dialogs)
@@ -250,8 +273,9 @@ class IETFSessionConverter:
         errors: list[str],
         warnings: list[str],
         recording_url: str | None = None,
+        recording_mediatype: str = "video/mp4",
     ) -> tuple[str | None, int]:
-        """Process video recording."""
+        """Process the session recording (video, or audio for older meetings)."""
         video_url = None
         dialog_index = -1
 
@@ -293,9 +317,13 @@ class IETFSessionConverter:
             if dialog_index < 0 and recording_url:
                 video_url = recording_url
                 dialog_index = builder.add_video_dialog_from_url(
-                    recording_url, session, mimetype="video/mp4"
+                    recording_url, session, mimetype=recording_mediatype
                 )
-                logger.info("Using recording URL from materials: %s", recording_url)
+                logger.info(
+                    "Using %s recording from materials: %s",
+                    recording_mediatype,
+                    recording_url,
+                )
 
             # Fallback to Meetecho
             if self.options.video_source in ("meetecho", "both") and dialog_index < 0:
