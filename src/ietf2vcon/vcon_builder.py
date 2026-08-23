@@ -6,7 +6,7 @@ vCon construction, WTF transcription, and lawful basis extensions.
 """
 
 import base64
-import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +16,8 @@ from vcon import Vcon
 from vcon.party import Party
 from vcon.dialog import Dialog
 
+from . import __version__
+from .hashing import content_hash_token
 from .models import (
     ChatMessage,
     IETFMaterial,
@@ -28,6 +30,11 @@ from .youtube import VideoMetadata
 from .zulip_client import chat_messages_to_json, chat_messages_to_text
 
 logger = logging.getLogger(__name__)
+
+
+def json_body(payload: dict[str, Any]) -> str:
+    """Serialize an attachment body. Bodies are strings, never objects."""
+    return json.dumps(payload, ensure_ascii=False)
 
 
 class VConBuilder:
@@ -51,11 +58,12 @@ class VConBuilder:
             f"Working Group Session"
         )
 
-        # Add meeting metadata as attachment
+        # Add meeting metadata as attachment. body is a JSON *string*: the spec
+        # requires a string body even when the content is JSON.
         self.vcon.add_attachment(
             purpose="meeting_metadata",
             encoding="json",
-            body={
+            body=json_body({
                 "ietf_meeting_number": meeting.number,
                 "location": f"{meeting.city}, {meeting.country}" if meeting.city else None,
                 "working_group": session.group_acronym,
@@ -63,7 +71,7 @@ class VConBuilder:
                 "room": session.room,
                 "start_time": session.start_time.isoformat() if session.start_time else None,
                 "duration_seconds": session.duration_seconds,
-            },
+            }),
         )
 
         return self
@@ -249,32 +257,68 @@ class VConBuilder:
         content: bytes | None = None,
         inline: bool = False,
     ) -> "VConBuilder":
-        """Add a meeting material as an attachment."""
-        if inline and content:
-            encoded = base64.urlsafe_b64encode(content).decode("ascii")
-            hash_value = hashlib.sha256(content).hexdigest()
+        """Add a meeting material as an attachment.
 
+        Three shapes, in order of preference:
+
+        1. ``inline`` with content -- the bytes are carried in the vCon.
+        2. content available -- a proper external reference: url, mediatype,
+           filename and content_hash as core-02 registers them, so any vCon
+           reader sees a linked, integrity-checked document. core-02 requires
+           url and content_hash together, which is why this needs the bytes.
+        3. otherwise -- a reference in the body. This is the only option for a
+           mutable landing page, and the fallback when a fetch fails.
+
+        ``title`` has no registered attachment parameter, so it rides in
+        ``meta``.
+        """
+        if inline and content:
             self.vcon.add_attachment(
                 purpose=material.type,
-                body=encoded,
+                body=base64.urlsafe_b64encode(content).decode("ascii"),
                 encoding="base64url",
                 mediatype=material.mimetype,
                 filename=material.filename,
-                content_hash=hash_value,
+                content_hash=content_hash_token(content),
             )
-        else:
+        elif content and not material.landing_page:
             self.vcon.add_attachment(
                 purpose=material.type,
-                body={
-                    "url": material.url,
-                    "mimetype": material.mimetype,
-                    "filename": material.filename,
-                    "title": material.title,
-                },
+                url=material.url,
+                content_hash=content_hash_token(content),
+                mediatype=material.mimetype,
+                filename=material.filename,
+            )
+            # vcon-lib has no meta kwarg, and an external reference has no body
+            # to carry a title, so set it on the serialized attachment.
+            if material.title:
+                self._set_attachment_meta(-1, {"title": material.title})
+        else:
+            # body MUST be a string, even when the content is JSON. Emitting a
+            # dict here is what the repo's core-02 migration had to clean up
+            # across the whole published corpus.
+            self.vcon.add_attachment(
+                purpose=material.type,
+                body=json.dumps(
+                    {
+                        "url": material.url,
+                        "mimetype": material.mimetype,
+                        "filename": material.filename,
+                        "title": material.title,
+                    },
+                    ensure_ascii=False,
+                ),
                 encoding="json",
             )
 
         return self
+
+    def _set_attachment_meta(self, index: int, meta: dict[str, Any]) -> None:
+        """Attach `meta` to a serialized attachment and declare the extension."""
+        self.vcon.vcon_dict["attachments"][index].setdefault("meta", {}).update(meta)
+        extensions = self.vcon.vcon_dict.setdefault("extensions", [])
+        if "meta" not in extensions:
+            extensions.append("meta")
 
     def add_materials(
         self,
@@ -282,10 +326,15 @@ class VConBuilder:
         inline: bool = False,
         downloader=None,
     ) -> "VConBuilder":
-        """Add multiple materials as attachments."""
+        """Add multiple materials as attachments.
+
+        The bytes are fetched whenever a downloader is available, not only for
+        inline mode: an external reference needs a content_hash, and the hash
+        needs the bytes.
+        """
         for material in materials:
             content = None
-            if inline and downloader:
+            if downloader and not material.landing_page:
                 content = downloader.get_material_content(material)
             self.add_material_attachment(material, content=content, inline=inline)
         return self
@@ -356,12 +405,12 @@ class VConBuilder:
         self.vcon.add_attachment(
             purpose="ingress_info",
             encoding="json",
-            body={
+            body=json_body({
                 "source": source,
-                "converter_version": "0.1.0",
+                "converter_version": __version__,
                 "converted_at": datetime.now(UTC).isoformat(),
                 **kwargs,
-            },
+            }),
         )
         return self
 
@@ -405,6 +454,13 @@ class VConBuilder:
             terms_of_service=terms_of_service,
             metadata=meta if meta else None,
         )
+        # vcon-lib's extension helper leaves the body as an object. The spec
+        # wants a string, so normalize here rather than emit a body no
+        # conforming reader should accept.
+        attachment = self.vcon.vcon_dict["attachments"][-1]
+        if isinstance(attachment.get("body"), dict):
+            attachment["body"] = json_body(attachment["body"])
+            attachment["encoding"] = "json"
         return self
 
     def add_ietf_note_well(self, session_start: datetime | None = None) -> "VConBuilder":
@@ -436,7 +492,24 @@ class VConBuilder:
     def build(self) -> Vcon:
         """Build and return the final vCon."""
         self.vcon.vcon_dict["updated_at"] = datetime.now(UTC).isoformat()
+        self._complete_attachments()
         return self.vcon
+
+    def _complete_attachments(self) -> None:
+        """Fill in the attachment fields core-02 requires.
+
+        `party`, `dialog` and `start` are required on every attachment. These
+        are vCon-level attachments -- they describe the session, not one
+        speaker's contribution -- so the convention is party 0, dialog 0 and
+        the vCon's own created_at. Applied at build time so attachments added
+        by vcon-lib extensions are covered too.
+        """
+        created_at = self.vcon.vcon_dict.get("created_at")
+        for attachment in self.vcon.vcon_dict.get("attachments") or []:
+            attachment.setdefault("party", 0)
+            attachment.setdefault("dialog", 0)
+            if created_at:
+                attachment.setdefault("start", created_at)
 
     def to_json(self, indent: int = 2) -> str:
         """Build and serialize to JSON."""

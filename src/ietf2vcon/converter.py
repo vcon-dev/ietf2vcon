@@ -4,6 +4,7 @@ This module coordinates the various components to convert an IETF session
 into a complete vCon document.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -72,6 +73,12 @@ class ConversionOptions:
 
     # Local rsync mirror directory (checked before HTTP for materials)
     rsync_mirror_dir: Path | None = None
+
+    # Reuse the uuid of an existing vCon for the same session, when one is
+    # already present in output_dir. Regenerating a session produces a new
+    # instance version of the same conversation, not a different conversation,
+    # so the identity has to survive. Turn this off only to mint a new vCon.
+    preserve_uuid: bool = True
 
     # Authentication (for Zulip)
     zulip_email: str | None = None
@@ -250,6 +257,9 @@ class IETFSessionConverter:
             # Build final vCon
             vcon = builder.build()
 
+            if self.options.preserve_uuid:
+                self._reuse_existing_uuid(vcon, meeting_number, group_acronym, session.session_id)
+
             return ConversionResult(
                 vcon=vcon,
                 meeting_number=meeting_number,
@@ -399,19 +409,21 @@ class IETFSessionConverter:
 
             non_recording_materials = [m for m in materials if m.type != "recording"]
 
-            if self.options.inline_materials:
-                downloader = MaterialsDownloader(
-                    download_dir=self.options.output_dir / "materials",
-                    mirror_dir=self.options.rsync_mirror_dir,
+            # A downloader is needed even when materials are not inlined: an
+            # external reference carries a content_hash, and the hash needs the
+            # bytes. It reads from the rsync mirror first when one is configured.
+            downloader = MaterialsDownloader(
+                download_dir=self.options.output_dir / "materials",
+                mirror_dir=self.options.rsync_mirror_dir,
+            )
+            try:
+                builder.add_materials(
+                    non_recording_materials,
+                    inline=self.options.inline_materials,
+                    downloader=downloader,
                 )
-                try:
-                    builder.add_materials(
-                        non_recording_materials, inline=True, downloader=downloader
-                    )
-                finally:
-                    downloader.close()
-            else:
-                builder.add_materials(non_recording_materials, inline=False)
+            finally:
+                downloader.close()
 
             count = len(non_recording_materials)
             logger.info("Added %d materials", count)
@@ -699,6 +711,32 @@ class IETFSessionConverter:
 
         return count
 
+    def _session_filename(self, meeting_number: int, group_acronym: str, session_id: str) -> str:
+        return f"ietf{meeting_number}_{group_acronym}_{session_id}.vcon.json"
+
+    def _reuse_existing_uuid(
+        self, vcon: Vcon, meeting_number: int, group_acronym: str, session_id: str
+    ) -> None:
+        """Keep the uuid of a previously generated vCon for this same session.
+
+        A regenerated session is the same conversation: anything that cited the
+        old uuid -- a database row, a published dataset, someone's bookmark --
+        must keep resolving. Only the content is rebuilt.
+        """
+        existing = self.options.output_dir / self._session_filename(
+            meeting_number, group_acronym, session_id
+        )
+        if not existing.is_file():
+            return
+        try:
+            previous_uuid = json.loads(existing.read_text()).get("uuid")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Could not read %s to preserve its uuid: %s", existing, e)
+            return
+        if previous_uuid and previous_uuid != vcon.vcon_dict.get("uuid"):
+            logger.info("Preserving uuid %s from %s", previous_uuid, existing.name)
+            vcon.vcon_dict["uuid"] = previous_uuid
+
     def save_vcon(
         self,
         result: ConversionResult,
@@ -714,11 +752,9 @@ class IETFSessionConverter:
             Path to the saved file
         """
         if output_path is None:
-            filename = (
-                f"ietf{result.meeting_number}_{result.group_acronym}"
-                f"_{result.session_id}.vcon.json"
+            output_path = self.options.output_dir / self._session_filename(
+                result.meeting_number, result.group_acronym, result.session_id
             )
-            output_path = self.options.output_dir / filename
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(result.vcon.to_json())

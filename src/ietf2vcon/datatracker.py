@@ -5,6 +5,7 @@ API documentation: https://datatracker.ietf.org/api/
 """
 
 import logging
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin
@@ -17,6 +18,9 @@ from .models import IETFMaterial, IETFMeeting, IETFPerson, IETFSession
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://datatracker.ietf.org"
+
+# A session document that is really a draft or RFC, not a meeting material.
+DOC_NAME_RE = re.compile(r"^(draft-|rfc\d+$)")
 API_BASE = f"{BASE_URL}/api/v1"
 
 
@@ -269,9 +273,16 @@ class DataTrackerClient:
                     mat_type = "document"
                     mimetype = "application/pdf"
 
-                # Build material URL
-                # Materials are at /meeting/{num}/materials/{doc-name}
-                url = f"{BASE_URL}/meeting/{meeting_number}/materials/{doc_name}"
+                # Build material URL. Session materials live under
+                # /meeting/{num}/materials/{doc-name}, but a draft or RFC
+                # discussed in session is not a meeting material -- it has its
+                # own datatracker page, and the /materials/ form 404s.
+                if DOC_NAME_RE.match(doc_name):
+                    url = f"{BASE_URL}/doc/{doc_name}/"
+                    mat_type, mimetype, landing_page = "document", "text/html", True
+                else:
+                    url = f"{BASE_URL}/meeting/{meeting_number}/materials/{doc_name}"
+                    landing_page = False
 
                 # For recordings, try to get the external URL
                 external_url = doc_data.get("external_url")
@@ -281,23 +292,27 @@ class DataTrackerClient:
                         type=mat_type,
                         title=doc_title,
                         url=external_url or url,
-                        filename=f"{doc_name}.pdf" if mimetype == "application/pdf" else doc_name,
+                        filename=None if landing_page
+                        else (f"{doc_name}.pdf" if mimetype == "application/pdf" else doc_name),
                         mimetype=mimetype,
                         order=item.get("order"),
+                        landing_page=landing_page,
                     )
                 )
 
         except Exception as e:
             logger.error(f"Failed to get materials for {group_acronym} at {meeting_number}: {e}")
 
-        # Also add agenda URL
-        agenda_url = f"{BASE_URL}/meeting/{meeting_number}/agenda/{group_acronym}/"
+        # Also add the session page, which carries the agenda. /meeting/N/agenda/<wg>/
+        # looks plausible and 404s; the real page is /meeting/N/session/<wg>/.
+        agenda_url = f"{BASE_URL}/meeting/{meeting_number}/session/{group_acronym}/"
         materials.append(
             IETFMaterial(
                 type="agenda",
                 title=f"{group_acronym.upper()} Agenda",
                 url=agenda_url,
                 mimetype="text/html",
+                landing_page=True,
             )
         )
 
@@ -309,6 +324,7 @@ class DataTrackerClient:
                 title=f"{group_acronym.upper()} Notes",
                 url=notes_url,
                 mimetype="text/markdown",
+                landing_page=True,
             )
         )
 

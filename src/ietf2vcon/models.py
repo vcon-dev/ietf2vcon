@@ -52,6 +52,11 @@ class IETFMaterial(BaseModel):
     filename: str | None = None
     mimetype: str | None = None
     order: int | None = None
+    # A mutable HTML page (draft page, session page, shared notes) rather than
+    # a published file. Its bytes change, so it is referenced from the body
+    # instead of being promoted to url + content_hash, which would assert an
+    # integrity guarantee that does not hold.
+    landing_page: bool = False
 
 
 class IETFPerson(BaseModel):
