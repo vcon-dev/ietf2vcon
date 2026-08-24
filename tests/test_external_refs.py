@@ -107,7 +107,7 @@ def test_regeneration_keeps_the_existing_uuid(tmp_path):
     vcon = VConBuilder().build()
     minted = vcon.vcon_dict["uuid"]
 
-    converter._reuse_existing_uuid(vcon, 125, "6lo", "35225")
+    converter._carry_over_previous(vcon, 125, "6lo", "35225", [])
 
     assert vcon.vcon_dict["uuid"] == "019d3273-65c9-8df3-9dd8-dd37220d739c"
     assert vcon.vcon_dict["uuid"] != minted
@@ -120,7 +120,7 @@ def test_first_generation_mints_a_uuid(tmp_path):
     vcon = VConBuilder().build()
     minted = vcon.vcon_dict["uuid"]
 
-    converter._reuse_existing_uuid(vcon, 125, "6lo", "35225")
+    converter._carry_over_previous(vcon, 125, "6lo", "35225", [])
 
     assert vcon.vcon_dict["uuid"] == minted
 

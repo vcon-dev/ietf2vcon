@@ -80,6 +80,12 @@ class ConversionOptions:
     # so the identity has to survive. Turn this off only to mint a new vCon.
     preserve_uuid: bool = True
 
+    # Carry an existing vCon's transcript across a regeneration that did not
+    # produce one of its own. Re-running ASR yields different text, and a
+    # regeneration meant to fix attachment structure should not silently
+    # rewrite -- or drop -- what was said.
+    preserve_analysis: bool = True
+
     # Authentication (for Zulip)
     zulip_email: str | None = None
     zulip_api_key: str | None = None
@@ -291,8 +297,9 @@ class IETFSessionConverter:
             # Build final vCon
             vcon = builder.build()
 
-            if self.options.preserve_uuid:
-                self._reuse_existing_uuid(vcon, meeting_number, group_acronym, session.session_id)
+            self._carry_over_previous(
+                vcon, meeting_number, group_acronym, session.session_id, warnings
+            )
 
             return ConversionResult(
                 vcon=vcon,
@@ -748,14 +755,23 @@ class IETFSessionConverter:
     def _session_filename(self, meeting_number: int, group_acronym: str, session_id: str) -> str:
         return f"ietf{meeting_number}_{group_acronym}_{session_id}.vcon.json"
 
-    def _reuse_existing_uuid(
-        self, vcon: Vcon, meeting_number: int, group_acronym: str, session_id: str
+    def _carry_over_previous(
+        self,
+        vcon: Vcon,
+        meeting_number: int,
+        group_acronym: str,
+        session_id: str,
+        warnings: list[str],
     ) -> None:
-        """Keep the uuid of a previously generated vCon for this same session.
+        """Carry identity and transcripts across from a previous conversion.
 
-        A regenerated session is the same conversation: anything that cited the
-        old uuid -- a database row, a published dataset, someone's bookmark --
-        must keep resolving. Only the content is rebuilt.
+        A regenerated session is the same conversation, so two things survive:
+
+        * the **uuid**, because anything that cited it -- a database row, a
+          published dataset, someone's bookmark -- must keep resolving;
+        * the **transcript**, because re-running ASR produces different text
+          and a regeneration meant to fix attachment structure has no business
+          rewriting what was said. Dropping it would be worse still.
         """
         existing = self.options.output_dir / self._session_filename(
             meeting_number, group_acronym, session_id
@@ -763,13 +779,64 @@ class IETFSessionConverter:
         if not existing.is_file():
             return
         try:
-            previous_uuid = json.loads(existing.read_text()).get("uuid")
+            previous = json.loads(existing.read_text())
         except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Could not read %s to preserve its uuid: %s", existing, e)
+            logger.warning("Could not read %s to carry its content over: %s", existing, e)
             return
-        if previous_uuid and previous_uuid != vcon.vcon_dict.get("uuid"):
-            logger.info("Preserving uuid %s from %s", previous_uuid, existing.name)
-            vcon.vcon_dict["uuid"] = previous_uuid
+
+        if self.options.preserve_uuid:
+            previous_uuid = previous.get("uuid")
+            if previous_uuid and previous_uuid != vcon.vcon_dict.get("uuid"):
+                logger.info("Preserving uuid %s from %s", previous_uuid, existing.name)
+                vcon.vcon_dict["uuid"] = previous_uuid
+
+        if self.options.preserve_analysis:
+            self._carry_over_analysis(vcon, previous, existing.name, warnings)
+
+    def _carry_over_analysis(
+        self, vcon: Vcon, previous: dict, name: str, warnings: list[str]
+    ) -> None:
+        """Bring the previous transcript across, with the dialog it points at.
+
+        Analysis entries address dialog by index, so the two move together. If
+        this conversion produced no dialog of its own the previous dialog comes
+        with the analysis and the indices still resolve; if it did produce
+        dialog, any analysis pointing past the end is left behind rather than
+        carried across as a dangling reference.
+        """
+        previous_analysis = previous.get("analysis") or []
+        if not previous_analysis or vcon.vcon_dict.get("analysis"):
+            return
+
+        dialog = vcon.vcon_dict.get("dialog") or []
+        if not dialog and previous.get("dialog"):
+            dialog = previous["dialog"]
+            vcon.vcon_dict["dialog"] = dialog
+
+        carried, dangling = [], 0
+        for analysis in previous_analysis:
+            index = analysis.get("dialog")
+            if index is not None and index >= len(dialog):
+                dangling += 1
+                continue
+            carried.append(analysis)
+
+        if dangling:
+            warnings.append(
+                f"{dangling} analysis entries from {name} reference dialog this "
+                "conversion did not produce, and were not carried over"
+            )
+        if not carried:
+            return
+
+        vcon.vcon_dict["analysis"] = carried
+        # The carried content is described by the previous file's extension
+        # declarations (wtf_transcription and friends), so those come too.
+        extensions = vcon.vcon_dict.setdefault("extensions", [])
+        for extension in previous.get("extensions") or []:
+            if extension not in extensions:
+                extensions.append(extension)
+        logger.info("Carried %d analysis entries over from %s", len(carried), name)
 
     def save_vcon(
         self,
