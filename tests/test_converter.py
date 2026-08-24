@@ -155,7 +155,7 @@ class TestIETFSessionConverter:
             (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
         )
         assert lb_att is not None
-        assert lb_att["body"]["metadata"]["terms_of_service_name"] == "IETF Note Well"
+        assert json.loads(lb_att["body"])["metadata"]["terms_of_service_name"] == "IETF Note Well"
 
     def test_convert_session_adds_ingress_info(
         self, converter, mock_datatracker, sample_ietf_meeting, sample_ietf_session
@@ -168,8 +168,8 @@ class TestIETFSessionConverter:
             (a for a in vcon.attachments if a.get("purpose") == "ingress_info"), None
         )
         assert ing_att is not None
-        assert ing_att["body"]["source"] == "ietf2vcon"
-        assert ing_att["body"]["meeting_number"] == 121
+        assert json.loads(ing_att["body"])["source"] == "ietf2vcon"
+        assert json.loads(ing_att["body"])["meeting_number"] == 121
 
     def test_convert_session_with_materials(
         self,

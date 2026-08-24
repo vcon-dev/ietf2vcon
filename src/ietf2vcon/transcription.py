@@ -207,7 +207,7 @@ class WtfServerTranscriber:
 
             # Build minimal vCon with inline audio
             vcon_payload = {
-                "vcon": "0.0.1",
+                "vcon": "0.4.0",
                 "parties": [{"name": "speaker"}],
                 "dialog": [
                     {

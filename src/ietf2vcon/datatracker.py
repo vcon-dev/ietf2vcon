@@ -5,7 +5,8 @@ API documentation: https://datatracker.ietf.org/api/
 """
 
 import logging
-from datetime import datetime
+import re
+from datetime import date, datetime
 from typing import Any
 from urllib.parse import urljoin
 
@@ -17,6 +18,9 @@ from .models import IETFMaterial, IETFMeeting, IETFPerson, IETFSession
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://datatracker.ietf.org"
+
+# A session document that is really a draft or RFC, not a meeting material.
+DOC_NAME_RE = re.compile(r"^(draft-|rfc\d+$)")
 API_BASE = f"{BASE_URL}/api/v1"
 
 
@@ -91,11 +95,15 @@ class DataTrackerClient:
 
     def get_group_sessions(
         self, meeting_number: int, group_acronym: str
-    ) -> list[IETFSession]:
+    ) -> list[IETFSession] | None:
         """Get sessions for a specific working group at a meeting.
 
         This method queries the API directly for the specific group,
         avoiding the need to fetch all sessions.
+
+        Returns None if the lookup failed, as distinct from an empty list,
+        which means the group genuinely did not meet. Callers must not treat
+        a failed lookup as "no sessions" -- see the caller in converter.py.
         """
         sessions = []
         try:
@@ -167,6 +175,7 @@ class DataTrackerClient:
 
         except Exception as e:
             logger.error(f"Failed to get sessions for {group_acronym} at {meeting_number}: {e}")
+            return None
 
         return sessions
 
@@ -269,9 +278,16 @@ class DataTrackerClient:
                     mat_type = "document"
                     mimetype = "application/pdf"
 
-                # Build material URL
-                # Materials are at /meeting/{num}/materials/{doc-name}
-                url = f"{BASE_URL}/meeting/{meeting_number}/materials/{doc_name}"
+                # Build material URL. Session materials live under
+                # /meeting/{num}/materials/{doc-name}, but a draft or RFC
+                # discussed in session is not a meeting material -- it has its
+                # own datatracker page, and the /materials/ form 404s.
+                if DOC_NAME_RE.match(doc_name):
+                    url = f"{BASE_URL}/doc/{doc_name}/"
+                    mat_type, mimetype, landing_page = "document", "text/html", True
+                else:
+                    url = f"{BASE_URL}/meeting/{meeting_number}/materials/{doc_name}"
+                    landing_page = False
 
                 # For recordings, try to get the external URL
                 external_url = doc_data.get("external_url")
@@ -281,23 +297,27 @@ class DataTrackerClient:
                         type=mat_type,
                         title=doc_title,
                         url=external_url or url,
-                        filename=f"{doc_name}.pdf" if mimetype == "application/pdf" else doc_name,
+                        filename=None if landing_page
+                        else (f"{doc_name}.pdf" if mimetype == "application/pdf" else doc_name),
                         mimetype=mimetype,
                         order=item.get("order"),
+                        landing_page=landing_page,
                     )
                 )
 
         except Exception as e:
             logger.error(f"Failed to get materials for {group_acronym} at {meeting_number}: {e}")
 
-        # Also add agenda URL
-        agenda_url = f"{BASE_URL}/meeting/{meeting_number}/agenda/{group_acronym}/"
+        # Also add the session page, which carries the agenda. /meeting/N/agenda/<wg>/
+        # looks plausible and 404s; the real page is /meeting/N/session/<wg>/.
+        agenda_url = f"{BASE_URL}/meeting/{meeting_number}/session/{group_acronym}/"
         materials.append(
             IETFMaterial(
                 type="agenda",
                 title=f"{group_acronym.upper()} Agenda",
                 url=agenda_url,
                 mimetype="text/html",
+                landing_page=True,
             )
         )
 
@@ -309,28 +329,122 @@ class DataTrackerClient:
                 title=f"{group_acronym.upper()} Notes",
                 url=notes_url,
                 mimetype="text/markdown",
+                landing_page=True,
             )
         )
 
         return materials
 
-    def get_group_chairs(self, group_acronym: str) -> list[IETFPerson]:
-        """Get current chairs for a working group."""
+    def _chair_roles_at(
+        self, group_acronym: str, session_start: datetime | date
+    ) -> list[dict] | None:
+        """Chair role records as they stood on a given date, or None.
+
+        The Datatracker keeps a snapshot of each group in `grouphistory` every
+        time the group record changes, with `rolehistory` rows hanging off each
+        snapshot. So the chairs of a 2014 session are the chairs recorded on the
+        newest snapshot that is not newer than the session.
+
+        Returns an empty list when the session predates the group's role
+        history (nothing before 2011-12-09 is resolvable), and None when the
+        history could not be read at all -- the caller falls back to current
+        roles only in the second case.
+        """
+        try:
+            snapshots = self._get(
+                "/api/v1/group/grouphistory/",
+                {
+                    "acronym": group_acronym,
+                    "limit": 1000,
+                },
+            ).get("objects", [])
+        except Exception as e:
+            logger.warning("Could not read group history for %s: %s", group_acronym, e)
+            return None
+        if not snapshots:
+            return None
+
+        # Compare full timestamps, not just dates. Chair handovers happen at
+        # the plenary, mid-meeting: the IAB chair changed from Tommy Pauly to
+        # Dhruv Dhody on 2026-03-16, the same day as IETF 125's IAB session.
+        # A date-only comparison lets that afternoon's snapshot claim a session
+        # that ran before it.
+        cutoff = session_start.isoformat()
+        precision = len(cutoff) if isinstance(session_start, datetime) else 10
+        earlier = [
+            s for s in snapshots
+            if s.get("time", "").replace("Z", "+00:00")[:precision] <= cutoff[:precision]
+        ]
+        if not earlier:
+            # Role history begins 2011-12-09 for every group, when the feature
+            # was switched on, so nothing before IETF 83 is resolvable. Report
+            # that rather than substituting a later snapshot: naming a 2026
+            # chair on a 2006 session is a fabrication, and an absent chair is
+            # the honest record.
+            logger.info(
+                "No %s role history at or before %s; leaving chairs unset",
+                group_acronym, cutoff,
+            )
+            return []
+        snapshot = max(earlier, key=lambda s: s["time"])
+
+        snapshot_id = snapshot["resource_uri"].rstrip("/").split("/")[-1]
+        try:
+            roles = self._get(
+                "/api/v1/group/rolehistory/",
+                {
+                    "group": snapshot_id,
+                    "name__slug": "chair",
+                    "limit": 50,
+                },
+            ).get("objects", [])
+        except Exception as e:
+            logger.warning("Could not read role history for %s: %s", group_acronym, e)
+            return None
+
+        if roles:
+            logger.info(
+                "Chairs for %s from the %s snapshot (session %s)",
+                group_acronym, snapshot["time"][:10], cutoff,
+            )
+        return roles or None
+
+    def get_group_chairs(
+        self, group_acronym: str, session_date: datetime | date | None = None
+    ) -> list[IETFPerson]:
+        """Get the chairs of a working group, as of `session_date` if given.
+
+        Pass the session's start *time* where it is known: chair handovers
+        happen mid-meeting, so a date alone can pick up a change that happened
+        hours after the session ended.
+
+        Without a date this returns whoever chairs the group *now*, which is
+        wrong for any historical session: a 2014 session recorded with 2026's
+        chairs credits people who were not in the room.
+        """
         chairs = []
         seen_names = set()
 
         try:
-            # Get current role holders (not history)
-            data = self._get(
-                "/api/v1/group/role/",
-                {
-                    "group__acronym": group_acronym,
-                    "name__slug": "chair",
-                    "limit": 10,
-                },
-            )
+            items = self._chair_roles_at(group_acronym, session_date) if session_date else None
+            if items == []:
+                return []  # session predates role history; no chairs is the truth
+            if items is None:
+                if session_date:
+                    logger.warning(
+                        "Could not read role history for %s; falling back to current chairs",
+                        group_acronym,
+                    )
+                items = self._get(
+                    "/api/v1/group/role/",
+                    {
+                        "group__acronym": group_acronym,
+                        "name__slug": "chair",
+                        "limit": 10,
+                    },
+                ).get("objects", [])
 
-            for item in data.get("objects", []):
+            for item in items:
                 person_uri = item.get("person")
                 if not person_uri:
                     continue

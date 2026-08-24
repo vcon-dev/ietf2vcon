@@ -457,6 +457,13 @@ def list_materials(meeting: int, group: str):
     help="Only convert specific groups (can specify multiple times)",
 )
 @click.option(
+    "--rsync-mirror",
+    type=click.Path(path_type=Path),
+    envvar="IETF_RSYNC_MIRROR",
+    help="Local rsync mirror root (checked before HTTP for materials). "
+         "Use 'ietf2vcon sync' to populate it.",
+)
+@click.option(
     "-v", "--verbose",
     is_flag=True,
     help="Enable verbose output",
@@ -472,6 +479,7 @@ def convert_all(
     no_video: bool,
     parallel: int,
     groups: tuple[str, ...],
+    rsync_mirror: Path | None,
     verbose: bool,
 ):
     """Convert all sessions from an IETF meeting to vCon format.
@@ -532,6 +540,7 @@ def convert_all(
         wtf_server_provider=wtf_server_provider,
         include_chat=False,
         output_dir=output_dir,
+        rsync_mirror_dir=rsync_mirror,
     )
 
     def convert_group(group: str) -> tuple[str, bool, str]:

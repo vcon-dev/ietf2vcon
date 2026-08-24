@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from .hashing import content_hash_token
 from .models import IETFMaterial
 from .rsync_mirror import find_local_file
 
@@ -41,6 +42,18 @@ class MaterialsDownloader:
     def __exit__(self, *args):
         self.close()
 
+    def _mirror_path(self, material: IETFMaterial) -> Path | None:
+        """This material in the local rsync mirror, if one is configured."""
+        if not self.mirror_dir or not material.url:
+            return None
+        doc_name = material.url.rstrip("/").split("/")[-1].split("?")[0]
+        parts = material.url.split("/")
+        try:
+            meeting_number = int(parts[parts.index("meeting") + 1])
+        except (ValueError, IndexError):
+            return None
+        return find_local_file(doc_name, meeting_number, self.mirror_dir)
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def download_material(self, material: IETFMaterial) -> Path | None:
         """Download a single material file.
@@ -55,27 +68,15 @@ class MaterialsDownloader:
             Path to the downloaded file, or None if failed
         """
         # Check local rsync mirror first
-        if self.mirror_dir and material.url:
-            doc_name = material.url.rstrip("/").split("/")[-1].split("?")[0]
-            # Extract meeting number from URL if present (e.g. /meeting/125/materials/...)
-            meeting_number = None
-            parts = material.url.split("/")
-            try:
-                idx = parts.index("meeting")
-                meeting_number = int(parts[idx + 1])
-            except (ValueError, IndexError):
-                pass
-
-            if meeting_number:
-                local_path = find_local_file(doc_name, meeting_number, self.mirror_dir)
-                if local_path:
-                    logger.info("Using mirror: %s", local_path)
-                    # Copy to download_dir so callers get a consistent location
-                    dest = self.download_dir / local_path.name
-                    if not dest.exists():
-                        import shutil
-                        shutil.copy2(local_path, dest)
-                    return dest
+        local_path = self._mirror_path(material)
+        if local_path:
+            logger.info("Using mirror: %s", local_path)
+            # Copy to download_dir so callers get a consistent location
+            dest = self.download_dir / local_path.name
+            if not dest.exists():
+                import shutil
+                shutil.copy2(local_path, dest)
+            return dest
 
         try:
             logger.info(f"Downloading: {material.title} from {material.url}")
@@ -142,35 +143,48 @@ class MaterialsDownloader:
         return downloaded
 
     def get_material_content(self, material: IETFMaterial) -> bytes | None:
-        """Get the content of a material without saving to disk.
+        """Get the content of a material without saving to disk."""
+        return self.fetch_material(material)[0]
 
-        Args:
-            material: The material to fetch
+    def fetch_material(
+        self, material: IETFMaterial
+    ) -> tuple[bytes | None, str | None, str | None]:
+        """Fetch a material and report what it actually is.
 
-        Returns:
-            Raw bytes content, or None if failed
+        Returns (content, mediatype, filename). The Datatracker API does not
+        say what a material's media type is, so the type was previously guessed
+        from the document name -- minutes and agendas were labelled
+        application/pdf and given a .pdf filename when most of them are plain
+        text. Now that the bytes are fetched anyway (an external reference needs
+        a content_hash), the observed type is used instead of a guess.
         """
+        local = self._mirror_path(material)
+        if local:
+            logger.info("Using mirror: %s", local)
+            mediatype, _ = mimetypes.guess_type(local.name)
+            return local.read_bytes(), mediatype, local.name
         try:
             response = self.client.get(material.url)
             response.raise_for_status()
-            return response.content
         except Exception as e:
             logger.error(f"Failed to fetch {material.url}: {e}")
-            return None
+            return None, None, None
 
-    def compute_hash(self, content: bytes, algorithm: str = "sha256") -> str:
-        """Compute hash of content for integrity verification.
+        mediatype = (response.headers.get("content-type") or "").split(";")[0].strip() or None
+        filename = None
+        disposition = response.headers.get("content-disposition", "")
+        if "filename=" in disposition:
+            filename = disposition.split("filename=")[-1].strip('"; ')
+        return response.content, mediatype, filename
 
-        Args:
-            content: Raw bytes to hash
-            algorithm: Hash algorithm (sha256, sha512, etc.)
+    def compute_hash(self, content: bytes, algorithm: str = "sha512") -> str:
+        """Content hash in the form core-02 requires.
 
-        Returns:
-            Hex-encoded hash string
+        Was a bare hex SHA-256, which no conforming reader can verify: the
+        spec's ContentHash is `<algorithm>-<base64url digest, unpadded>` and
+        SHA-512 is the algorithm that MUST be supported.
         """
-        hasher = hashlib.new(algorithm)
-        hasher.update(content)
-        return hasher.hexdigest()
+        return content_hash_token(content, algorithm)
 
     def get_mimetype(self, filepath: Path) -> str:
         """Determine the MIME type of a file.

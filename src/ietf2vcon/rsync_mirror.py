@@ -13,6 +13,7 @@ Mirror layout (mirrors rsync.ietf.org::proceedings/{meeting}/):
 """
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -68,8 +69,12 @@ def find_local_file(doc_name: str, meeting_number: int, local_dir: Path) -> Path
     The rsync server stores files as:
         proceedings/{meeting}/{type}/{doc_name}.{ext}
 
-    The Datatracker URL basename (doc_name) matches the rsync filename
-    without extension, e.g. ``slides-125-6lo-chairs-introduction-00``.
+    Datatracker material URLs carry no revision suffix
+    (``minutes-125-6lo``), while the rsync tree stores every revision
+    (``minutes-125-6lo-00.txt`` ... ``-03.txt``). The unversioned URL serves
+    the latest, so the highest revision on disk is the match. Without this the
+    mirror never resolves anything and every lookup silently falls back to
+    HTTP.
 
     Args:
         doc_name: Document name from Datatracker URL (no extension)
@@ -112,6 +117,19 @@ def find_local_file(doc_name: str, meeting_number: int, local_dir: Path) -> Path
         if matches:
             logger.debug("Mirror hit (glob): %s", matches[0])
             return matches[0]
+        # Revision-suffixed: doc-00.pdf, doc-01.pdf ... Take the highest.
+        # The suffix must be purely numeric, so a longer document name that
+        # merely starts with this one cannot masquerade as a revision of it.
+        revision = re.compile(rf"^{re.escape(doc_name)}-(\d+)\.[^.]+$")
+        revisions = [
+            (int(m.group(1)), path)
+            for path in subdir_path.glob(f"{doc_name}-*")
+            if (m := revision.match(path.name))
+        ]
+        if revisions:
+            latest = max(revisions)[1]
+            logger.debug("Mirror hit (revision): %s", latest)
+            return latest
 
     return None
 

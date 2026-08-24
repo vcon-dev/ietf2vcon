@@ -4,6 +4,7 @@ This module coordinates the various components to convert an IETF session
 into a complete vCon document.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -73,6 +74,18 @@ class ConversionOptions:
     # Local rsync mirror directory (checked before HTTP for materials)
     rsync_mirror_dir: Path | None = None
 
+    # Reuse the uuid of an existing vCon for the same session, when one is
+    # already present in output_dir. Regenerating a session produces a new
+    # instance version of the same conversation, not a different conversation,
+    # so the identity has to survive. Turn this off only to mint a new vCon.
+    preserve_uuid: bool = True
+
+    # Carry an existing vCon's transcript across a regeneration that did not
+    # produce one of its own. Re-running ASR yields different text, and a
+    # regeneration meant to fix attachment structure should not silently
+    # rewrite -- or drop -- what was said.
+    preserve_analysis: bool = True
+
     # Authentication (for Zulip)
     zulip_email: str | None = None
     zulip_api_key: str | None = None
@@ -135,17 +148,34 @@ class IETFSessionConverter:
                 meeting = IETFMeeting(number=meeting_number)
                 warnings.append(f"Could not fetch meeting {meeting_number} metadata")
 
-            # Get sessions for the group
+            # Get sessions for the group.
+            #
+            # This used to fall back to a synthetic session -- id
+            # "<group>-<meeting>", start_time = now -- whenever the lookup came
+            # back empty. A transient API failure therefore produced a
+            # plausible-looking vCon stamped with today's date and a fresh
+            # uuid, reported as a success. Seven of IETF 125's records were
+            # fabricated that way in a single batch run. Refuse instead.
             sessions = datatracker.get_group_sessions(meeting_number, group_acronym)
-            if not sessions:
-                session = IETFSession(
-                    meeting_number=meeting_number,
-                    group_acronym=group_acronym,
-                    session_id=f"{group_acronym}-{meeting_number}",
-                    start_time=datetime.utcnow(),
+            if sessions is None:
+                errors.append(
+                    f"Could not look up sessions for {group_acronym} at IETF {meeting_number}"
                 )
-                warnings.append("Could not find session data, using defaults")
-            elif session_index < len(sessions):
+                return ConversionResult(
+                    vcon=VConBuilder().build(), meeting_number=meeting_number,
+                    group_acronym=group_acronym, session_id="",
+                    errors=errors, warnings=warnings,
+                )
+            if not sessions:
+                errors.append(
+                    f"{group_acronym} has no sessions at IETF {meeting_number}"
+                )
+                return ConversionResult(
+                    vcon=VConBuilder().build(), meeting_number=meeting_number,
+                    group_acronym=group_acronym, session_id="",
+                    errors=errors, warnings=warnings,
+                )
+            if session_index < len(sessions):
                 session = sessions[session_index]
             else:
                 session = sessions[0]
@@ -166,14 +196,31 @@ class IETFSessionConverter:
             # Add IETF Note Well as lawful basis for recording/processing
             builder.add_ietf_note_well()
 
-            # Add chairs as parties
-            chairs = datatracker.get_group_chairs(group_acronym)
+            # Add chairs as parties. The session start time matters: without
+            # it the Datatracker returns today's chairs, so a 2014 session
+            # would credit whoever chairs the group now. When the schedule
+            # lookup did not yield a start time we cannot date the roles, so
+            # no chairs are asserted rather than today's being assumed.
+            session_date = session.start_time
+            if session_date:
+                chairs = datatracker.get_group_chairs(group_acronym, session_date=session_date)
+            else:
+                chairs = []
+                warnings.append(
+                    "Session start time unknown; chairs left unset rather than "
+                    "asserting the current ones"
+                )
             if chairs:
                 builder.add_persons(chairs)
             else:
-                builder.add_party(
-                    name=f"{group_acronym.upper()} Chairs",
-                    role="chair",
+                # Role history starts 2011-12-09, and some sessions have no
+                # scheduled time to date the roles against. Either way, no
+                # chair party beats a "<WG> Chairs" placeholder standing in for
+                # people we cannot name. The attendees party is still added, so
+                # the vCon is complete without it.
+                logger.info(
+                    "No verifiable chairs for %s at %s; omitting the chair party",
+                    group_acronym, session_date,
                 )
 
             # Add attendees party
@@ -249,6 +296,10 @@ class IETFSessionConverter:
 
             # Build final vCon
             vcon = builder.build()
+
+            self._carry_over_previous(
+                vcon, meeting_number, group_acronym, session.session_id, warnings
+            )
 
             return ConversionResult(
                 vcon=vcon,
@@ -399,19 +450,21 @@ class IETFSessionConverter:
 
             non_recording_materials = [m for m in materials if m.type != "recording"]
 
-            if self.options.inline_materials:
-                downloader = MaterialsDownloader(
-                    download_dir=self.options.output_dir / "materials",
-                    mirror_dir=self.options.rsync_mirror_dir,
+            # A downloader is needed even when materials are not inlined: an
+            # external reference carries a content_hash, and the hash needs the
+            # bytes. It reads from the rsync mirror first when one is configured.
+            downloader = MaterialsDownloader(
+                download_dir=self.options.output_dir / "materials",
+                mirror_dir=self.options.rsync_mirror_dir,
+            )
+            try:
+                builder.add_materials(
+                    non_recording_materials,
+                    inline=self.options.inline_materials,
+                    downloader=downloader,
                 )
-                try:
-                    builder.add_materials(
-                        non_recording_materials, inline=True, downloader=downloader
-                    )
-                finally:
-                    downloader.close()
-            else:
-                builder.add_materials(non_recording_materials, inline=False)
+            finally:
+                downloader.close()
 
             count = len(non_recording_materials)
             logger.info("Added %d materials", count)
@@ -699,6 +752,92 @@ class IETFSessionConverter:
 
         return count
 
+    def _session_filename(self, meeting_number: int, group_acronym: str, session_id: str) -> str:
+        return f"ietf{meeting_number}_{group_acronym}_{session_id}.vcon.json"
+
+    def _carry_over_previous(
+        self,
+        vcon: Vcon,
+        meeting_number: int,
+        group_acronym: str,
+        session_id: str,
+        warnings: list[str],
+    ) -> None:
+        """Carry identity and transcripts across from a previous conversion.
+
+        A regenerated session is the same conversation, so two things survive:
+
+        * the **uuid**, because anything that cited it -- a database row, a
+          published dataset, someone's bookmark -- must keep resolving;
+        * the **transcript**, because re-running ASR produces different text
+          and a regeneration meant to fix attachment structure has no business
+          rewriting what was said. Dropping it would be worse still.
+        """
+        existing = self.options.output_dir / self._session_filename(
+            meeting_number, group_acronym, session_id
+        )
+        if not existing.is_file():
+            return
+        try:
+            previous = json.loads(existing.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Could not read %s to carry its content over: %s", existing, e)
+            return
+
+        if self.options.preserve_uuid:
+            previous_uuid = previous.get("uuid")
+            if previous_uuid and previous_uuid != vcon.vcon_dict.get("uuid"):
+                logger.info("Preserving uuid %s from %s", previous_uuid, existing.name)
+                vcon.vcon_dict["uuid"] = previous_uuid
+
+        if self.options.preserve_analysis:
+            self._carry_over_analysis(vcon, previous, existing.name, warnings)
+
+    def _carry_over_analysis(
+        self, vcon: Vcon, previous: dict, name: str, warnings: list[str]
+    ) -> None:
+        """Bring the previous transcript across, with the dialog it points at.
+
+        Analysis entries address dialog by index, so the two move together. If
+        this conversion produced no dialog of its own the previous dialog comes
+        with the analysis and the indices still resolve; if it did produce
+        dialog, any analysis pointing past the end is left behind rather than
+        carried across as a dangling reference.
+        """
+        previous_analysis = previous.get("analysis") or []
+        if not previous_analysis or vcon.vcon_dict.get("analysis"):
+            return
+
+        dialog = vcon.vcon_dict.get("dialog") or []
+        if not dialog and previous.get("dialog"):
+            dialog = previous["dialog"]
+            vcon.vcon_dict["dialog"] = dialog
+
+        carried, dangling = [], 0
+        for analysis in previous_analysis:
+            index = analysis.get("dialog")
+            if index is not None and index >= len(dialog):
+                dangling += 1
+                continue
+            carried.append(analysis)
+
+        if dangling:
+            warnings.append(
+                f"{dangling} analysis entries from {name} reference dialog this "
+                "conversion did not produce, and were not carried over"
+            )
+        if not carried:
+            return
+
+        vcon.vcon_dict["analysis"] = carried
+        # The carried content is described by the previous file's extension
+        # declarations (wtf_transcription and friends), so those come too.
+        extensions = vcon.vcon_dict.setdefault("extensions", [])
+        for extension in previous.get("extensions") or []:
+            if extension not in extensions:
+                extensions.append(extension)
+        logger.info("Carried %d analysis entries over from %s", len(carried), name)
+
     def save_vcon(
         self,
         result: ConversionResult,
@@ -714,11 +853,9 @@ class IETFSessionConverter:
             Path to the saved file
         """
         if output_path is None:
-            filename = (
-                f"ietf{result.meeting_number}_{result.group_acronym}"
-                f"_{result.session_id}.vcon.json"
+            output_path = self.options.output_dir / self._session_filename(
+                result.meeting_number, result.group_acronym, result.session_id
             )
-            output_path = self.options.output_dir / filename
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(result.vcon.to_json())
