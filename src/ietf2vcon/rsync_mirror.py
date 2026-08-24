@@ -10,6 +10,9 @@ Mirror layout (mirrors rsync.ietf.org::proceedings/{meeting}/):
     downloads/proceedings/{meeting}/minutes/minutes-{meeting}-{group}-*.*
     downloads/proceedings/{meeting}/chatlog/...
     downloads/proceedings/{meeting}/bluesheets/...
+
+Before IETF 83 the tree drops the type and meeting from the filename, keeping
+only the group: slides/6man-0.pdf rather than slides/slides-80-6man-0.pdf.
 """
 
 import logging
@@ -130,6 +133,44 @@ def find_local_file(doc_name: str, meeting_number: int, local_dir: Path) -> Path
             latest = max(revisions)[1]
             logger.debug("Mirror hit (revision): %s", latest)
             return latest
+
+    legacy = _find_legacy_file(doc_name, meeting_dir, search_dirs)
+    if legacy:
+        logger.debug("Mirror hit (legacy layout): %s", legacy)
+        return legacy
+
+    return None
+
+
+# `slides-80-6man-0` -> type `slides`, meeting `80`, remainder `6man-0`.
+LEGACY_DOC_RE = re.compile(rf"^({'|'.join(MATERIAL_SUBDIRS)})-(\d+)-(.+)$")
+
+
+def _find_legacy_file(doc_name: str, meeting_dir: Path, search_dirs: list[str]) -> Path | None:
+    """Resolve a doc name against the pre-IETF-83 mirror layout.
+
+    Meetings 66-82 store a material under its group alone -- `slides/6man-0.pdf`
+    -- while the Datatracker names it `slides-80-6man-0`. Stripping the type and
+    meeting number off the front leaves exactly the stem on disk. Matching is
+    case-insensitive because the old tree preserves the group's own casing
+    (`slides/CreatingID-0.pdf`) where the Datatracker lowercases it.
+
+    Without this, every material for meetings 66-82 misses -- 17,430 of them
+    across the published corpus.
+    """
+    match = LEGACY_DOC_RE.match(doc_name)
+    if not match:
+        return None
+
+    subdir_name, remainder = match.group(1), match.group(3).lower()
+    # The type in the name is authoritative here; it is where the file lives.
+    for candidate_dir in [subdir_name, *search_dirs]:
+        subdir_path = meeting_dir / candidate_dir
+        if not subdir_path.is_dir():
+            continue
+        for path in sorted(subdir_path.iterdir()):
+            if path.is_file() and path.stem.lower() == remainder:
+                return path
 
     return None
 
