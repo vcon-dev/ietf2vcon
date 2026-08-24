@@ -6,7 +6,7 @@ API documentation: https://datatracker.ietf.org/api/
 
 import logging
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from urllib.parse import urljoin
 
@@ -330,23 +330,92 @@ class DataTrackerClient:
 
         return materials
 
-    def get_group_chairs(self, group_acronym: str) -> list[IETFPerson]:
-        """Get current chairs for a working group."""
+    def _chair_roles_at(self, group_acronym: str, session_date: date) -> list[dict] | None:
+        """Chair role records as they stood on a given date, or None.
+
+        The Datatracker keeps a snapshot of each group in `grouphistory` every
+        time the group record changes, with `rolehistory` rows hanging off each
+        snapshot. So the chairs of a 2014 session are the chairs recorded on the
+        newest snapshot that is not newer than the session.
+        """
+        try:
+            snapshots = self._get(
+                "/api/v1/group/grouphistory/",
+                {
+                    "acronym": group_acronym,
+                    "limit": 1000,
+                },
+            ).get("objects", [])
+        except Exception as e:
+            logger.warning("Could not read group history for %s: %s", group_acronym, e)
+            return None
+        if not snapshots:
+            return None
+
+        cutoff = session_date.isoformat()
+        earlier = [s for s in snapshots if s.get("time", "")[:10] <= cutoff]
+        if earlier:
+            snapshot = max(earlier, key=lambda s: s["time"])
+        else:
+            # The group's history starts after this session -- unusual, but the
+            # oldest snapshot is still closer to the session than today's roles.
+            snapshot = min(snapshots, key=lambda s: s["time"])
+            logger.info(
+                "No %s snapshot at or before %s; using the oldest (%s)",
+                group_acronym, cutoff, snapshot["time"],
+            )
+
+        snapshot_id = snapshot["resource_uri"].rstrip("/").split("/")[-1]
+        try:
+            roles = self._get(
+                "/api/v1/group/rolehistory/",
+                {
+                    "group": snapshot_id,
+                    "name__slug": "chair",
+                    "limit": 50,
+                },
+            ).get("objects", [])
+        except Exception as e:
+            logger.warning("Could not read role history for %s: %s", group_acronym, e)
+            return None
+
+        if roles:
+            logger.info(
+                "Chairs for %s from the %s snapshot (session %s)",
+                group_acronym, snapshot["time"][:10], cutoff,
+            )
+        return roles or None
+
+    def get_group_chairs(
+        self, group_acronym: str, session_date: date | None = None
+    ) -> list[IETFPerson]:
+        """Get the chairs of a working group, as of `session_date` if given.
+
+        Without a date this returns whoever chairs the group *now*, which is
+        wrong for any historical session: a 2014 session recorded with 2026's
+        chairs credits people who were not in the room.
+        """
         chairs = []
         seen_names = set()
 
         try:
-            # Get current role holders (not history)
-            data = self._get(
-                "/api/v1/group/role/",
-                {
-                    "group__acronym": group_acronym,
-                    "name__slug": "chair",
-                    "limit": 10,
-                },
-            )
+            items = self._chair_roles_at(group_acronym, session_date) if session_date else None
+            if items is None:
+                if session_date:
+                    logger.warning(
+                        "No role history for %s at %s; falling back to current chairs",
+                        group_acronym, session_date.isoformat(),
+                    )
+                items = self._get(
+                    "/api/v1/group/role/",
+                    {
+                        "group__acronym": group_acronym,
+                        "name__slug": "chair",
+                        "limit": 10,
+                    },
+                ).get("objects", [])
 
-            for item in data.get("objects", []):
+            for item in items:
                 person_uri = item.get("person")
                 if not person_uri:
                     continue

@@ -173,8 +173,11 @@ class IETFSessionConverter:
             # Add IETF Note Well as lawful basis for recording/processing
             builder.add_ietf_note_well()
 
-            # Add chairs as parties
-            chairs = datatracker.get_group_chairs(group_acronym)
+            # Add chairs as parties. The session date matters: without it the
+            # Datatracker returns today's chairs, so a 2014 session would credit
+            # whoever chairs the group now.
+            session_date = session.start_time.date() if session.start_time else None
+            chairs = datatracker.get_group_chairs(group_acronym, session_date=session_date)
             if chairs:
                 builder.add_persons(chairs)
             else:
