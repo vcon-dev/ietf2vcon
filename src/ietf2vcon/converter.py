@@ -180,6 +180,14 @@ class IETFSessionConverter:
             chairs = datatracker.get_group_chairs(group_acronym, session_date=session_date)
             if chairs:
                 builder.add_persons(chairs)
+            elif session_date:
+                # Chairs could not be resolved for this date (role history
+                # starts 2011-12-09). No chair party at all beats a placeholder
+                # standing in for people we cannot name.
+                logger.info(
+                    "No verifiable chairs for %s at %s; omitting the chair party",
+                    group_acronym, session_date,
+                )
             else:
                 builder.add_party(
                     name=f"{group_acronym.upper()} Chairs",

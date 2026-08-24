@@ -337,6 +337,11 @@ class DataTrackerClient:
         time the group record changes, with `rolehistory` rows hanging off each
         snapshot. So the chairs of a 2014 session are the chairs recorded on the
         newest snapshot that is not newer than the session.
+
+        Returns an empty list when the session predates the group's role
+        history (nothing before 2011-12-09 is resolvable), and None when the
+        history could not be read at all -- the caller falls back to current
+        roles only in the second case.
         """
         try:
             snapshots = self._get(
@@ -354,16 +359,18 @@ class DataTrackerClient:
 
         cutoff = session_date.isoformat()
         earlier = [s for s in snapshots if s.get("time", "")[:10] <= cutoff]
-        if earlier:
-            snapshot = max(earlier, key=lambda s: s["time"])
-        else:
-            # The group's history starts after this session -- unusual, but the
-            # oldest snapshot is still closer to the session than today's roles.
-            snapshot = min(snapshots, key=lambda s: s["time"])
+        if not earlier:
+            # Role history begins 2011-12-09 for every group, when the feature
+            # was switched on, so nothing before IETF 83 is resolvable. Report
+            # that rather than substituting a later snapshot: naming a 2026
+            # chair on a 2006 session is a fabrication, and an absent chair is
+            # the honest record.
             logger.info(
-                "No %s snapshot at or before %s; using the oldest (%s)",
-                group_acronym, cutoff, snapshot["time"],
+                "No %s role history at or before %s; leaving chairs unset",
+                group_acronym, cutoff,
             )
+            return []
+        snapshot = max(earlier, key=lambda s: s["time"])
 
         snapshot_id = snapshot["resource_uri"].rstrip("/").split("/")[-1]
         try:
@@ -400,11 +407,13 @@ class DataTrackerClient:
 
         try:
             items = self._chair_roles_at(group_acronym, session_date) if session_date else None
+            if items == []:
+                return []  # session predates role history; no chairs is the truth
             if items is None:
                 if session_date:
                     logger.warning(
-                        "No role history for %s at %s; falling back to current chairs",
-                        group_acronym, session_date.isoformat(),
+                        "Could not read role history for %s; falling back to current chairs",
+                        group_acronym,
                     )
                 items = self._get(
                     "/api/v1/group/role/",

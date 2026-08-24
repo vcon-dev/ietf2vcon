@@ -67,10 +67,14 @@ def test_a_later_session_gets_the_later_snapshot(client):
     assert names(chairs) == ["Todays Chair"]
 
 
-def test_session_predating_all_history_uses_the_oldest_snapshot(client):
-    """Closer to the session than today's roles, and logged as a fallback."""
-    chairs = client.get_group_chairs("6man", session_date=date(2006, 7, 10))
-    assert names(chairs) == ["Old Chair"]
+def test_session_predating_all_history_gets_no_chairs(client):
+    """Role history starts 2011-12-09, so a 2006 session has no resolvable chairs.
+
+    Naming a later chair on a 2006 session would be a fabrication; an absent
+    chair party is the honest record.
+    """
+    assert client.get_group_chairs("6man", session_date=date(2006, 7, 10)) == []
+    assert all(path != "/api/v1/group/role/" for path, _ in client.calls)
 
 
 def test_no_date_still_returns_current_chairs(client):
