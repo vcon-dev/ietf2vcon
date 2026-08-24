@@ -95,11 +95,15 @@ class DataTrackerClient:
 
     def get_group_sessions(
         self, meeting_number: int, group_acronym: str
-    ) -> list[IETFSession]:
+    ) -> list[IETFSession] | None:
         """Get sessions for a specific working group at a meeting.
 
         This method queries the API directly for the specific group,
         avoiding the need to fetch all sessions.
+
+        Returns None if the lookup failed, as distinct from an empty list,
+        which means the group genuinely did not meet. Callers must not treat
+        a failed lookup as "no sessions" -- see the caller in converter.py.
         """
         sessions = []
         try:
@@ -171,6 +175,7 @@ class DataTrackerClient:
 
         except Exception as e:
             logger.error(f"Failed to get sessions for {group_acronym} at {meeting_number}: {e}")
+            return None
 
         return sessions
 
@@ -330,7 +335,9 @@ class DataTrackerClient:
 
         return materials
 
-    def _chair_roles_at(self, group_acronym: str, session_date: date) -> list[dict] | None:
+    def _chair_roles_at(
+        self, group_acronym: str, session_start: datetime | date
+    ) -> list[dict] | None:
         """Chair role records as they stood on a given date, or None.
 
         The Datatracker keeps a snapshot of each group in `grouphistory` every
@@ -357,8 +364,17 @@ class DataTrackerClient:
         if not snapshots:
             return None
 
-        cutoff = session_date.isoformat()
-        earlier = [s for s in snapshots if s.get("time", "")[:10] <= cutoff]
+        # Compare full timestamps, not just dates. Chair handovers happen at
+        # the plenary, mid-meeting: the IAB chair changed from Tommy Pauly to
+        # Dhruv Dhody on 2026-03-16, the same day as IETF 125's IAB session.
+        # A date-only comparison lets that afternoon's snapshot claim a session
+        # that ran before it.
+        cutoff = session_start.isoformat()
+        precision = len(cutoff) if isinstance(session_start, datetime) else 10
+        earlier = [
+            s for s in snapshots
+            if s.get("time", "").replace("Z", "+00:00")[:precision] <= cutoff[:precision]
+        ]
         if not earlier:
             # Role history begins 2011-12-09 for every group, when the feature
             # was switched on, so nothing before IETF 83 is resolvable. Report
@@ -394,9 +410,13 @@ class DataTrackerClient:
         return roles or None
 
     def get_group_chairs(
-        self, group_acronym: str, session_date: date | None = None
+        self, group_acronym: str, session_date: datetime | date | None = None
     ) -> list[IETFPerson]:
         """Get the chairs of a working group, as of `session_date` if given.
+
+        Pass the session's start *time* where it is known: chair handovers
+        happen mid-meeting, so a date alone can pick up a change that happened
+        hours after the session ended.
 
         Without a date this returns whoever chairs the group *now*, which is
         wrong for any historical session: a 2014 session recorded with 2026's

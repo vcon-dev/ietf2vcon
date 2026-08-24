@@ -142,17 +142,34 @@ class IETFSessionConverter:
                 meeting = IETFMeeting(number=meeting_number)
                 warnings.append(f"Could not fetch meeting {meeting_number} metadata")
 
-            # Get sessions for the group
+            # Get sessions for the group.
+            #
+            # This used to fall back to a synthetic session -- id
+            # "<group>-<meeting>", start_time = now -- whenever the lookup came
+            # back empty. A transient API failure therefore produced a
+            # plausible-looking vCon stamped with today's date and a fresh
+            # uuid, reported as a success. Seven of IETF 125's records were
+            # fabricated that way in a single batch run. Refuse instead.
             sessions = datatracker.get_group_sessions(meeting_number, group_acronym)
-            if not sessions:
-                session = IETFSession(
-                    meeting_number=meeting_number,
-                    group_acronym=group_acronym,
-                    session_id=f"{group_acronym}-{meeting_number}",
-                    start_time=datetime.utcnow(),
+            if sessions is None:
+                errors.append(
+                    f"Could not look up sessions for {group_acronym} at IETF {meeting_number}"
                 )
-                warnings.append("Could not find session data, using defaults")
-            elif session_index < len(sessions):
+                return ConversionResult(
+                    vcon=VConBuilder().build(), meeting_number=meeting_number,
+                    group_acronym=group_acronym, session_id="",
+                    errors=errors, warnings=warnings,
+                )
+            if not sessions:
+                errors.append(
+                    f"{group_acronym} has no sessions at IETF {meeting_number}"
+                )
+                return ConversionResult(
+                    vcon=VConBuilder().build(), meeting_number=meeting_number,
+                    group_acronym=group_acronym, session_id="",
+                    errors=errors, warnings=warnings,
+                )
+            if session_index < len(sessions):
                 session = sessions[session_index]
             else:
                 session = sessions[0]
@@ -173,25 +190,31 @@ class IETFSessionConverter:
             # Add IETF Note Well as lawful basis for recording/processing
             builder.add_ietf_note_well()
 
-            # Add chairs as parties. The session date matters: without it the
-            # Datatracker returns today's chairs, so a 2014 session would credit
-            # whoever chairs the group now.
-            session_date = session.start_time.date() if session.start_time else None
-            chairs = datatracker.get_group_chairs(group_acronym, session_date=session_date)
+            # Add chairs as parties. The session start time matters: without
+            # it the Datatracker returns today's chairs, so a 2014 session
+            # would credit whoever chairs the group now. When the schedule
+            # lookup did not yield a start time we cannot date the roles, so
+            # no chairs are asserted rather than today's being assumed.
+            session_date = session.start_time
+            if session_date:
+                chairs = datatracker.get_group_chairs(group_acronym, session_date=session_date)
+            else:
+                chairs = []
+                warnings.append(
+                    "Session start time unknown; chairs left unset rather than "
+                    "asserting the current ones"
+                )
             if chairs:
                 builder.add_persons(chairs)
-            elif session_date:
-                # Chairs could not be resolved for this date (role history
-                # starts 2011-12-09). No chair party at all beats a placeholder
-                # standing in for people we cannot name.
+            else:
+                # Role history starts 2011-12-09, and some sessions have no
+                # scheduled time to date the roles against. Either way, no
+                # chair party beats a "<WG> Chairs" placeholder standing in for
+                # people we cannot name. The attendees party is still added, so
+                # the vCon is complete without it.
                 logger.info(
                     "No verifiable chairs for %s at %s; omitting the chair party",
                     group_acronym, session_date,
-                )
-            else:
-                builder.add_party(
-                    name=f"{group_acronym.upper()} Chairs",
-                    role="chair",
                 )
 
             # Add attendees party
