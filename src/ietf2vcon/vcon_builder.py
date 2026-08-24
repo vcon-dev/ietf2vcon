@@ -335,7 +335,12 @@ class VConBuilder:
         for material in materials:
             content = None
             if downloader and not material.landing_page:
-                content = downloader.get_material_content(material)
+                content, mediatype, filename = downloader.fetch_material(material)
+                # Prefer what the file actually is over what the doc name implied.
+                if mediatype:
+                    material.mimetype = mediatype
+                if filename:
+                    material.filename = filename
             self.add_material_attachment(material, content=content, inline=inline)
         return self
 

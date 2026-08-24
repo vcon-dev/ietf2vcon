@@ -123,3 +123,81 @@ def test_first_generation_mints_a_uuid(tmp_path):
     converter._reuse_existing_uuid(vcon, 125, "6lo", "35225")
 
     assert vcon.vcon_dict["uuid"] == minted
+
+
+class TestMirrorLookup:
+    """The rsync mirror never resolved anything before this.
+
+    Datatracker material URLs carry no revision suffix; the rsync tree stores
+    every revision. `find_local_file` only tried `{doc}.{ext}` and `{doc}.*`,
+    so every lookup missed and silently fell back to throttled HTTP.
+    """
+
+    def _mirror(self, tmp_path, *names):
+        subdir = tmp_path / "proceedings" / "125" / "minutes"
+        subdir.mkdir(parents=True)
+        for name in names:
+            (subdir / name).write_text("x")
+        return tmp_path
+
+    def test_finds_the_highest_revision(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(
+            tmp_path,
+            "minutes-125-6lo-00.txt",
+            "minutes-125-6lo-01.txt",
+            "minutes-125-6lo-03.txt",
+            "minutes-125-6lo-02.txt",
+        )
+        found = find_local_file("minutes-125-6lo", 125, mirror)
+        assert found is not None and found.name == "minutes-125-6lo-03.txt"
+
+    def test_unversioned_file_still_matches(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "minutes-125-6lo.txt")
+        found = find_local_file("minutes-125-6lo", 125, mirror)
+        assert found is not None and found.name == "minutes-125-6lo.txt"
+
+    def test_a_longer_name_is_not_mistaken_for_a_revision(self, tmp_path):
+        """`minutes-125-6lo-extra-00.txt` is a different document."""
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "minutes-125-6lo-extra-00.txt")
+        assert find_local_file("minutes-125-6lo", 125, mirror) is None
+
+    def test_miss_returns_none(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "minutes-125-tls-00.txt")
+        assert find_local_file("minutes-125-6lo", 125, mirror) is None
+
+
+def test_observed_mediatype_beats_the_guess(tmp_path, builder):
+    """The doc name said .pdf; the bytes say text/plain. The bytes win.
+
+    Datatracker's API does not report a media type, so anything matching
+    "minutes"/"agenda" was labelled application/pdf with a fabricated .pdf
+    filename. Most of them are plain text.
+    """
+    from ietf2vcon.materials import MaterialsDownloader
+
+    subdir = tmp_path / "proceedings" / "125" / "minutes"
+    subdir.mkdir(parents=True)
+    (subdir / "minutes-125-6lo-03.txt").write_text("plain text minutes")
+
+    material = IETFMaterial(
+        type="minutes",
+        title="Minutes IETF125: 6lo",
+        url="https://datatracker.ietf.org/meeting/125/materials/minutes-125-6lo",
+        filename="minutes-125-6lo.pdf",
+        mimetype="application/pdf",
+    )
+    with MaterialsDownloader(download_dir=tmp_path / "dl", mirror_dir=tmp_path) as downloader:
+        builder.add_materials([material], downloader=downloader)
+
+    att = attachments(builder)[-1]
+    assert att["mediatype"] == "text/plain"
+    assert att["filename"] == "minutes-125-6lo-03.txt"
+    assert att["content_hash"] == content_hash_token(b"plain text minutes")

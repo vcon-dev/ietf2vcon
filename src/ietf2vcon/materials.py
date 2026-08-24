@@ -143,25 +143,39 @@ class MaterialsDownloader:
         return downloaded
 
     def get_material_content(self, material: IETFMaterial) -> bytes | None:
-        """Get the content of a material without saving to disk.
+        """Get the content of a material without saving to disk."""
+        return self.fetch_material(material)[0]
 
-        Args:
-            material: The material to fetch
+    def fetch_material(
+        self, material: IETFMaterial
+    ) -> tuple[bytes | None, str | None, str | None]:
+        """Fetch a material and report what it actually is.
 
-        Returns:
-            Raw bytes content, or None if failed
+        Returns (content, mediatype, filename). The Datatracker API does not
+        say what a material's media type is, so the type was previously guessed
+        from the document name -- minutes and agendas were labelled
+        application/pdf and given a .pdf filename when most of them are plain
+        text. Now that the bytes are fetched anyway (an external reference needs
+        a content_hash), the observed type is used instead of a guess.
         """
         local = self._mirror_path(material)
         if local:
             logger.info("Using mirror: %s", local)
-            return local.read_bytes()
+            mediatype, _ = mimetypes.guess_type(local.name)
+            return local.read_bytes(), mediatype, local.name
         try:
             response = self.client.get(material.url)
             response.raise_for_status()
-            return response.content
         except Exception as e:
             logger.error(f"Failed to fetch {material.url}: {e}")
-            return None
+            return None, None, None
+
+        mediatype = (response.headers.get("content-type") or "").split(";")[0].strip() or None
+        filename = None
+        disposition = response.headers.get("content-disposition", "")
+        if "filename=" in disposition:
+            filename = disposition.split("filename=")[-1].strip('"; ')
+        return response.content, mediatype, filename
 
     def compute_hash(self, content: bytes, algorithm: str = "sha512") -> str:
         """Content hash in the form core-02 requires.
