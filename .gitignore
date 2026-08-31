@@ -144,3 +144,5 @@ downloads/
 *.srt
 *.vtt
 .venv/
+
+.DS_Store

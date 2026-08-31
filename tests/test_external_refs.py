@@ -174,6 +174,66 @@ class TestMirrorLookup:
         assert find_local_file("minutes-125-6lo", 125, mirror) is None
 
 
+class TestLegacyMirrorLayout:
+    """Meetings 66-82 name a material by its group alone.
+
+    The Datatracker calls it `slides-80-6man-0`; the rsync tree of that era
+    stores `slides/6man-0.pdf`. Every one of the 17,430 materials in that range
+    missed before this.
+    """
+
+    def _mirror(self, tmp_path, subdir, *names):
+        path = tmp_path / "proceedings" / "80" / subdir
+        path.mkdir(parents=True)
+        for name in names:
+            (path / name).write_text("x")
+        return tmp_path
+
+    def test_resolves_group_only_filename(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "slides", "6man-0.pdf", "6man-1.pdf")
+        found = find_local_file("slides-80-6man-0", 80, mirror)
+        assert found is not None and found.name == "6man-0.pdf"
+
+    def test_matching_ignores_case(self, tmp_path):
+        """The old tree keeps the group's casing; the Datatracker lowercases."""
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "slides", "CreatingID-0.pdf")
+        found = find_local_file("slides-80-creatingid-0", 80, mirror)
+        assert found is not None and found.name == "CreatingID-0.pdf"
+
+    def test_agenda_and_minutes_keep_their_own_extensions(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "agenda", "6lowpan.txt")
+        (tmp_path / "proceedings" / "80" / "minutes").mkdir()
+        (tmp_path / "proceedings" / "80" / "minutes" / "6man.txt").write_text("x")
+
+        assert find_local_file("agenda-80-6lowpan", 80, mirror).name == "6lowpan.txt"
+        assert find_local_file("minutes-80-6man", 80, mirror).name == "6man.txt"
+
+    def test_a_different_group_is_not_a_match(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "slides", "tls-0.pdf")
+        assert find_local_file("slides-80-6man-0", 80, mirror) is None
+
+    def test_modern_layout_still_wins(self, tmp_path):
+        """A modern tree must not be dragged through the legacy path."""
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = tmp_path / "m"
+        subdir = mirror / "proceedings" / "125" / "minutes"
+        subdir.mkdir(parents=True)
+        (subdir / "minutes-125-6lo-00.txt").write_text("x")
+        (subdir / "6lo.txt").write_text("wrong")
+
+        found = find_local_file("minutes-125-6lo", 125, mirror)
+        assert found is not None and found.name == "minutes-125-6lo-00.txt"
+
+
 def test_observed_mediatype_beats_the_guess(tmp_path, builder):
     """The doc name said .pdf; the bytes say text/plain. The bytes win.
 
