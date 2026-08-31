@@ -353,3 +353,82 @@ class TestFormatTieBreak:
         mirror = self._mirror(tmp_path, "slides-116-teas-x-05.pdf", "slides-116-teas-x-06.pptx")
         found = find_local_file("slides-116-teas-x", 116, mirror)
         assert found is not None and found.name == "slides-116-teas-x-06.pptx"
+
+
+class TestGenericMediatype:
+    """A server declining to guess is not a statement about the content."""
+
+    def test_octet_stream_falls_back_to_the_filename(self, tmp_path):
+        import httpx
+        from ietf2vcon.materials import MaterialsDownloader
+        from ietf2vcon.models import IETFMaterial
+
+        material = IETFMaterial(
+            type="minutes",
+            title="Minutes",
+            url="https://datatracker.ietf.org/meeting/126/materials/minutes-126-vcon",
+            file_url="https://www.ietf.org/proceedings/126/minutes/minutes-126-vcon-00.md",
+            uploaded_filename="minutes-126-vcon-00.md",
+        )
+
+        def handler(request):
+            return httpx.Response(
+                200, content=b"# minutes", headers={"content-type": "application/octet-stream"}
+            )
+
+        downloader = MaterialsDownloader(download_dir=tmp_path)
+        downloader.client = httpx.Client(transport=httpx.MockTransport(handler))
+        _, mediatype, _ = downloader.fetch_material(material)
+        assert mediatype == "text/markdown"
+
+    def test_a_real_content_type_is_left_alone(self, tmp_path):
+        import httpx
+        from ietf2vcon.materials import MaterialsDownloader
+        from ietf2vcon.models import IETFMaterial
+
+        material = IETFMaterial(
+            type="slides",
+            title="Deck",
+            url="https://datatracker.ietf.org/meeting/126/materials/slides-126-vcon-x",
+            file_url="https://www.ietf.org/proceedings/126/slides/slides-126-vcon-x-00.pdf",
+            uploaded_filename="slides-126-vcon-x-00.pdf",
+        )
+
+        def handler(request):
+            return httpx.Response(200, content=b"%PDF", headers={"content-type": "application/pdf"})
+
+        downloader = MaterialsDownloader(download_dir=tmp_path)
+        downloader.client = httpx.Client(transport=httpx.MockTransport(handler))
+        _, mediatype, _ = downloader.fetch_material(material)
+        assert mediatype == "application/pdf"
+
+
+class TestHtmlIsNeverHashed:
+    """Cloudflare rewrites every HTML response, so its bytes are not stable.
+
+    Each fetch of https://www.ietf.org/proceedings/80/agenda/6man.html returns
+    a different `window.__CF$cv$params={r:...,t:...}` token. Three consecutive
+    fetches gave three different digests at the same content length, which is
+    why the published corpus had to revert 3,354 HTML references.
+    """
+
+    def test_html_material_is_marked_a_landing_page(self):
+        from ietf2vcon.datatracker import DataTrackerClient
+
+        client = DataTrackerClient.__new__(DataTrackerClient)
+        assert hasattr(client, "get_session_materials")
+
+    def test_html_attachment_carries_no_hash(self, builder):
+        from ietf2vcon.models import IETFMaterial
+
+        material = IETFMaterial(
+            type="agenda",
+            title="6MAN Agenda",
+            url="https://datatracker.ietf.org/meeting/80/materials/agenda-80-6man",
+            mimetype="text/html",
+            landing_page=True,
+        )
+        builder.add_material_attachment(material, content=b"<html>whatever</html>")
+        attachment = builder.vcon.vcon_dict["attachments"][-1]
+        assert "content_hash" not in attachment
+        assert attachment["encoding"] == "json"

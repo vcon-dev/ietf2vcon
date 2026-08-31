@@ -307,6 +307,14 @@ class DataTrackerClient:
                 # the extension guess below, which cannot tell a deck published
                 # as pdf from the pptx sitting beside it.
                 uploaded_filename = None if landing_page else doc_data.get("uploaded_filename")
+                # Cloudflare injects a per-request token into every HTML
+                # response (window.__CF$cv$params={r:...,t:...}), so an IETF
+                # HTML page returns different bytes on every fetch and no
+                # content_hash can describe it. Treat it as the landing page it
+                # effectively is.
+                if uploaded_filename and uploaded_filename.lower().endswith((".htm", ".html")):
+                    landing_page = True
+                    uploaded_filename = None
                 file_url = (
                     proceedings_url(meeting_number, mat_type, uploaded_filename)
                     if uploaded_filename

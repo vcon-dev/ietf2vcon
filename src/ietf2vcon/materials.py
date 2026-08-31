@@ -52,14 +52,6 @@ class MaterialsDownloader:
         except (ValueError, IndexError):
             return None
 
-        # HTML is the one format whose served bytes disagree with the mirror
-        # copy, so it is fetched rather than read from disk. Measured across
-        # the published corpus: every other format matches byte for byte.
-        if material.uploaded_filename and material.uploaded_filename.lower().endswith(
-            (".htm", ".html")
-        ):
-            return None
-
         # The document record names the published file, so go straight to it
         # rather than guessing which sibling the extension search lands on.
         if material.uploaded_filename:
@@ -197,6 +189,12 @@ class MaterialsDownloader:
             return None, None, None
 
         mediatype = (response.headers.get("content-type") or "").split(";")[0].strip() or None
+        # www.ietf.org serves Markdown as application/octet-stream. That is the
+        # server declining to guess, not a statement about the content, so the
+        # filename wins wherever it implies something specific.
+        if mediatype in (None, "application/octet-stream"):
+            guessed, _ = mimetypes.guess_type(material.uploaded_filename or material.url)
+            mediatype = guessed or mediatype
         filename = None
         disposition = response.headers.get("content-disposition", "")
         if "filename=" in disposition:
