@@ -57,6 +57,15 @@ class IETFMaterial(BaseModel):
     # instead of being promoted to url + content_hash, which would assert an
     # integrity guarantee that does not hold.
     landing_page: bool = False
+    # The file the IETF publishes, as the Datatracker names it
+    # (`slides-116-teas-...-05.pdf`). The document record is authoritative:
+    # guessing at the extension picks the wrong sibling wherever a deck exists
+    # as both .pdf and .pptx.
+    uploaded_filename: str | None = None
+    # Where those exact bytes are served. `url` is the Datatracker page, which
+    # is a display endpoint -- it renders Markdown as HTML and converts
+    # PowerPoint to PDF -- so it cannot be what a content_hash describes.
+    file_url: str | None = None
 
 
 class IETFPerson(BaseModel):

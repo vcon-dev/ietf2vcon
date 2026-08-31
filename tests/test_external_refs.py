@@ -261,3 +261,95 @@ def test_observed_mediatype_beats_the_guess(tmp_path, builder):
     assert att["mediatype"] == "text/plain"
     assert att["filename"] == "minutes-125-6lo-03.txt"
     assert att["content_hash"] == content_hash_token(b"plain text minutes")
+
+
+class TestVerifiableReferences:
+    """A content_hash has to describe what its url returns.
+
+    The Datatracker material URL is a display endpoint: it renders Markdown
+    agendas as HTML pages and converts PowerPoint decks to PDF. Hashing the
+    published file and pointing at that URL produced references that fail on
+    first check across the published corpus.
+    """
+
+    def test_reference_points_at_the_verbatim_file(self, builder):
+        from ietf2vcon.models import IETFMaterial
+
+        material = IETFMaterial(
+            type="slides",
+            title="Chair slides",
+            url="https://datatracker.ietf.org/meeting/126/materials/slides-126-vcon-chairs",
+            file_url="https://www.ietf.org/proceedings/126/slides/slides-126-vcon-chairs-00.pdf",
+            filename="slides-126-vcon-chairs-00.pdf",
+            mimetype="application/pdf",
+        )
+        builder.add_material_attachment(material, content=b"%PDF-1.6 body")
+        attachment = builder.vcon.vcon_dict["attachments"][-1]
+
+        assert attachment["url"] == material.file_url
+        assert attachment["content_hash"].startswith("sha512-")
+        assert attachment["meta"]["datatracker_url"] == material.url
+
+    def test_page_is_kept_for_a_human_to_open(self, builder):
+        from ietf2vcon.models import IETFMaterial
+
+        material = IETFMaterial(
+            type="agenda",
+            title="VCON Agenda",
+            url="https://datatracker.ietf.org/meeting/126/materials/agenda-126-vcon",
+            file_url="https://www.ietf.org/proceedings/126/agenda/agenda-126-vcon-00.md",
+            filename="agenda-126-vcon-00.md",
+            mimetype="text/markdown",
+        )
+        builder.add_material_attachment(material, content=b"# agenda")
+        meta = builder.vcon.vcon_dict["attachments"][-1]["meta"]
+        assert meta["title"] == "VCON Agenda"
+        assert "datatracker.ietf.org" in meta["datatracker_url"]
+
+    def test_no_file_url_falls_back_to_the_page(self, builder):
+        """Older documents have no uploaded_filename; the page is all there is."""
+        from ietf2vcon.models import IETFMaterial
+
+        material = IETFMaterial(
+            type="slides",
+            title="Old deck",
+            url="https://datatracker.ietf.org/meeting/70/materials/slides-70-16ng-0",
+            filename="16ng-0.ppt",
+        )
+        builder.add_material_attachment(material, content=b"deck")
+        attachment = builder.vcon.vcon_dict["attachments"][-1]
+        assert attachment["url"] == material.url
+        assert "datatracker_url" not in attachment.get("meta", {})
+
+
+class TestFormatTieBreak:
+    """A deck published as pdf sits beside the pptx it was converted from."""
+
+    def _mirror(self, tmp_path, *names):
+        subdir = tmp_path / "proceedings" / "116" / "slides"
+        subdir.mkdir(parents=True)
+        for name in names:
+            (subdir / name).write_text("x")
+        return tmp_path
+
+    def test_pdf_wins_over_pptx_at_the_same_revision(self, tmp_path):
+        """Path sort took the pptx; the Datatracker serves the pdf."""
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "slides-116-teas-x-05.pptx", "slides-116-teas-x-05.pdf")
+        found = find_local_file("slides-116-teas-x", 116, mirror)
+        assert found is not None and found.name == "slides-116-teas-x-05.pdf"
+
+    def test_the_only_format_is_used_whatever_it_is(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "slides-116-teas-x-05.pptx")
+        found = find_local_file("slides-116-teas-x", 116, mirror)
+        assert found is not None and found.name == "slides-116-teas-x-05.pptx"
+
+    def test_a_later_revision_still_wins_over_a_preferred_extension(self, tmp_path):
+        from ietf2vcon.rsync_mirror import find_local_file
+
+        mirror = self._mirror(tmp_path, "slides-116-teas-x-05.pdf", "slides-116-teas-x-06.pptx")
+        found = find_local_file("slides-116-teas-x", 116, mirror)
+        assert found is not None and found.name == "slides-116-teas-x-06.pptx"

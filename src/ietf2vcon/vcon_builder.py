@@ -282,17 +282,28 @@ class VConBuilder:
                 content_hash=content_hash_token(content),
             )
         elif content and not material.landing_page:
+            # The reference points at the file, not at the page about it. The
+            # Datatracker material URL renders Markdown as HTML and converts
+            # PowerPoint to PDF, so a content_hash of the published bytes
+            # cannot describe what it serves; www.ietf.org/proceedings returns
+            # them verbatim. The page is still what a human should open, so it
+            # is kept alongside.
             self.vcon.add_attachment(
                 purpose=material.type,
-                url=material.url,
+                url=material.file_url or material.url,
                 content_hash=content_hash_token(content),
                 mediatype=material.mimetype,
                 filename=material.filename,
             )
             # vcon-lib has no meta kwarg, and an external reference has no body
             # to carry a title, so set it on the serialized attachment.
+            meta = {}
             if material.title:
-                self._set_attachment_meta(-1, {"title": material.title})
+                meta["title"] = material.title
+            if material.file_url and material.file_url != material.url:
+                meta["datatracker_url"] = material.url
+            if meta:
+                self._set_attachment_meta(-1, meta)
         else:
             # body MUST be a string, even when the content is JSON. Emitting a
             # dict here is what the repo's core-02 migration had to clean up

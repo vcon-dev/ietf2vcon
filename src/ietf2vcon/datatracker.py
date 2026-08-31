@@ -6,6 +6,7 @@ API documentation: https://datatracker.ietf.org/api/
 
 import logging
 import re
+from pathlib import Path
 from datetime import date, datetime
 from typing import Any
 from urllib.parse import urljoin
@@ -21,6 +22,16 @@ BASE_URL = "https://datatracker.ietf.org"
 
 # A session document that is really a draft or RFC, not a meeting material.
 DOC_NAME_RE = re.compile(r"^(draft-|rfc\d+$)")
+
+# Where the IETF serves each published file verbatim. This is the tree
+# rsync.ietf.org::proceedings mirrors, and unlike the Datatracker material URL
+# it returns the bytes as uploaded rather than a rendered or converted view.
+PROCEEDINGS_BASE = "https://www.ietf.org/proceedings"
+
+
+def proceedings_url(meeting_number: int, mat_type: str, uploaded_filename: str) -> str:
+    """The verbatim location of a published material."""
+    return f"{PROCEEDINGS_BASE}/{meeting_number}/{mat_type}/{uploaded_filename}"
 API_BASE = f"{BASE_URL}/api/v1"
 
 
@@ -292,16 +303,39 @@ class DataTrackerClient:
                 # For recordings, try to get the external URL
                 external_url = doc_data.get("external_url")
 
+                # The document record names the published file. Trust it over
+                # the extension guess below, which cannot tell a deck published
+                # as pdf from the pptx sitting beside it.
+                uploaded_filename = None if landing_page else doc_data.get("uploaded_filename")
+                file_url = (
+                    proceedings_url(meeting_number, mat_type, uploaded_filename)
+                    if uploaded_filename
+                    else None
+                )
+
                 materials.append(
                     IETFMaterial(
                         type=mat_type,
                         title=doc_title,
                         url=external_url or url,
-                        filename=None if landing_page
-                        else (f"{doc_name}.pdf" if mimetype == "application/pdf" else doc_name),
+                        filename=(
+                            None
+                            if landing_page
+                            else (
+                                Path(uploaded_filename).name
+                                if uploaded_filename
+                                else (
+                                    f"{doc_name}.pdf"
+                                    if mimetype == "application/pdf"
+                                    else doc_name
+                                )
+                            )
+                        ),
                         mimetype=mimetype,
                         order=item.get("order"),
                         landing_page=landing_page,
+                        uploaded_filename=uploaded_filename,
+                        file_url=file_url,
                     )
                 )
 
