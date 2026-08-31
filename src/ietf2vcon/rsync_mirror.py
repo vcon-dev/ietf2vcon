@@ -27,6 +27,19 @@ IETF_RSYNC = "rsync.ietf.org::proceedings"
 # Subdirs that contain per-session materials (in priority order for lookup)
 MATERIAL_SUBDIRS = ["slides", "agenda", "minutes", "chatlog", "bluesheets", "procmaterials"]
 
+# Extensions in the order the Datatracker prefers to serve them. A deck
+# uploaded as PowerPoint is published as a converted pdf alongside the
+# original, and the pdf is what the material URL returns.
+EXTENSION_PREFERENCE = [".pdf", ".txt", ".md", ".html", ".htm", ".pptx", ".ppt", ".docx", ".doc"]
+
+
+def _extension_rank(path: Path) -> int:
+    """Position in EXTENSION_PREFERENCE; unknown extensions sort last."""
+    suffix = path.suffix.lower()
+    return EXTENSION_PREFERENCE.index(suffix) if suffix in EXTENSION_PREFERENCE else len(
+        EXTENSION_PREFERENCE
+    )
+
 
 def sync_proceedings(meeting_number: int, local_dir: Path, dry_run: bool = False) -> bool:
     """Rsync IETF meeting proceedings to a local directory.
@@ -110,7 +123,7 @@ def find_local_file(doc_name: str, meeting_number: int, local_dir: Path) -> Path
         if not subdir_path.exists():
             continue
         # Try exact match with common extensions
-        for ext in [".pdf", ".txt", ".md", ".html", ".htm", ".pptx", ".docx"]:
+        for ext in EXTENSION_PREFERENCE:
             candidate = subdir_path / f"{doc_name}{ext}"
             if candidate.exists():
                 logger.debug("Mirror hit: %s", candidate)
@@ -124,13 +137,17 @@ def find_local_file(doc_name: str, meeting_number: int, local_dir: Path) -> Path
         # The suffix must be purely numeric, so a longer document name that
         # merely starts with this one cannot masquerade as a revision of it.
         revision = re.compile(rf"^{re.escape(doc_name)}-(\d+)\.[^.]+$")
+        # A document can exist in several formats at the same revision
+        # (`-05.pdf` and `-05.pptx`). Sorting by path would pick whichever
+        # extension sorts last; the Datatracker publishes the pdf. Rank by
+        # EXTENSION_PREFERENCE so the tie breaks the same way it is served.
         revisions = [
-            (int(m.group(1)), path)
+            (int(m.group(1)), -_extension_rank(path), path)
             for path in subdir_path.glob(f"{doc_name}-*")
             if (m := revision.match(path.name))
         ]
         if revisions:
-            latest = max(revisions)[1]
+            latest = max(revisions)[2]
             logger.debug("Mirror hit (revision): %s", latest)
             return latest
 

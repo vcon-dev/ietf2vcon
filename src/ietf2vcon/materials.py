@@ -46,12 +46,34 @@ class MaterialsDownloader:
         """This material in the local rsync mirror, if one is configured."""
         if not self.mirror_dir or not material.url:
             return None
-        doc_name = material.url.rstrip("/").split("/")[-1].split("?")[0]
         parts = material.url.split("/")
         try:
             meeting_number = int(parts[parts.index("meeting") + 1])
         except (ValueError, IndexError):
             return None
+
+        # HTML is the one format whose served bytes disagree with the mirror
+        # copy, so it is fetched rather than read from disk. Measured across
+        # the published corpus: every other format matches byte for byte.
+        if material.uploaded_filename and material.uploaded_filename.lower().endswith(
+            (".htm", ".html")
+        ):
+            return None
+
+        # The document record names the published file, so go straight to it
+        # rather than guessing which sibling the extension search lands on.
+        if material.uploaded_filename:
+            exact = (
+                self.mirror_dir
+                / "proceedings"
+                / str(meeting_number)
+                / material.type
+                / material.uploaded_filename
+            )
+            if exact.is_file():
+                return exact
+
+        doc_name = material.url.rstrip("/").split("/")[-1].split("?")[0]
         return find_local_file(doc_name, meeting_number, self.mirror_dir)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
@@ -163,11 +185,15 @@ class MaterialsDownloader:
             logger.info("Using mirror: %s", local)
             mediatype, _ = mimetypes.guess_type(local.name)
             return local.read_bytes(), mediatype, local.name
+        # Fetch the verbatim file where one is known. The Datatracker material
+        # URL renders and converts, so hashing what it returns would describe a
+        # view rather than the published document.
+        target = material.file_url or material.url
         try:
-            response = self.client.get(material.url)
+            response = self.client.get(target)
             response.raise_for_status()
         except Exception as e:
-            logger.error(f"Failed to fetch {material.url}: {e}")
+            logger.error(f"Failed to fetch {target}: {e}")
             return None, None, None
 
         mediatype = (response.headers.get("content-type") or "").split(";")[0].strip() or None
