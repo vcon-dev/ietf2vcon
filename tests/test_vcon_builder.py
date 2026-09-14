@@ -1,9 +1,8 @@
 """Unit tests for ietf2vcon.vcon_builder module."""
 
+import json
 from datetime import datetime
 from pathlib import Path
-
-import json
 
 import pytest
 
@@ -135,7 +134,10 @@ class TestVConBuilderDialogs:
 
         assert idx == 0
         assert len(vcon.dialog) == 1
-        assert vcon.dialog[0]["type"] == "video"
+        # vcon-core dialog types are recording/text/transfer/incomplete.
+        # "video" is not one of them; the media type carries the video-ness.
+        assert vcon.dialog[0]["type"] == "recording"
+        assert vcon.dialog[0]["mediatype"] == "video/mp4"
         assert vcon.dialog[0]["url"] == sample_video_metadata.url
 
     def test_add_video_dialog_from_url(self, sample_ietf_session):
@@ -148,7 +150,7 @@ class TestVConBuilderDialogs:
         vcon = builder.build()
 
         assert vcon.dialog[idx]["url"] == "https://youtube.com/watch?v=abc123"
-        assert vcon.dialog[idx]["type"] == "video"
+        assert vcon.dialog[idx]["type"] == "recording"
 
     def test_add_chat_dialog(self, sample_chat_messages, sample_ietf_session):
         """Test adding chat dialog."""
@@ -213,16 +215,57 @@ class TestVConBuilderTranscript:
     """Tests for transcript/analysis in VConBuilder."""
 
     def test_add_transcript(self, sample_transcription_result):
-        """Test adding transcript as WTF attachment."""
+        """A transcript is an analysis object, not an attachment.
+
+        draft-howe-vcon-wtf-extension section 6.1 requires the analysis
+        object. vcon-core requires a string body with encoding "json", and
+        vendor on every analysis object.
+        """
         builder = VConBuilder()
         builder.add_transcript(sample_transcription_result, dialog_index=0)
         vcon = builder.build()
 
-        # WTF transcription goes to attachments in vcon-lib
-        wtf_att = next(
-            (a for a in vcon.attachments if a.get("purpose") == "wtf_transcription"), None
+        assert not [
+            a for a in vcon.attachments
+            if (a.get("purpose") or a.get("type")) == "wtf_transcription"
+        ], "transcript must not be written as an attachment"
+
+        wtf = next(
+            (a for a in vcon.analysis if a.get("type") == "wtf_transcription"), None
         )
-        assert wtf_att is not None
+        assert wtf is not None
+        assert wtf["vendor"], "vendor is required on every analysis object"
+        assert wtf["encoding"] == "json"
+        assert isinstance(wtf["body"], str), "analysis body must be a string"
+        body = json.loads(wtf["body"])
+        assert body["transcript"]["text"]
+        assert body["segments"]
+        assert "wtf_transcription" in vcon.vcon_dict["extensions"]
+
+    def test_party_role_declares_role_extension(self):
+        """Using party.role obliges the vCon to declare the role extension."""
+        builder = VConBuilder()
+        builder.add_party(name="Brian Rosen", role="chair")
+        vcon = builder.build()
+
+        assert vcon.parties[0]["role"] == "chair"
+        assert "role" in vcon.vcon_dict["extensions"]
+
+    def test_note_well_carries_proof_mechanisms(self):
+        """A lawful basis with no proof_mechanisms[] is hollow."""
+        builder = VConBuilder()
+        builder.add_ietf_note_well()
+        vcon = builder.build()
+
+        lb = next(
+            a for a in vcon.attachments
+            if (a.get("purpose") or a.get("type")) == "lawful_basis"
+        )
+        body = json.loads(lb["body"])
+        assert body["lawful_basis"] == "legitimate_interests"
+        assert body["proof_mechanisms"], "proof_mechanisms[] must not be empty"
+        assert all(m.get("mechanism_type") for m in body["proof_mechanisms"])
+        assert all(m.get("description") for m in body["proof_mechanisms"])
 
     def test_add_analysis_generic(self):
         """Test adding generic analysis."""

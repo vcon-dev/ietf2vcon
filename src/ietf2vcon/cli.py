@@ -61,12 +61,26 @@ def main():
     pass
 
 
+def _meeting_number(ctx, param, value):
+    """Accept either a numbered meeting or an interim name.
+
+    The Datatracker's `number` field holds both: 124 for a numbered meeting,
+    interim-2026-vcon-02 for an interim. Digits are normalized back to int so
+    the meeting number written into the vCon keeps the type it has always had.
+    """
+    if value is None:
+        return None
+    return int(value) if str(value).isdigit() else value
+
+
 @main.command()
 @click.option(
     "-m", "--meeting",
-    type=int,
+    type=str,
+    callback=_meeting_number,
     required=True,
-    help="IETF meeting number (e.g., 124)",
+    help="IETF meeting number (e.g., 124) or interim name "
+         "(e.g., interim-2026-vcon-02)",
 )
 @click.option(
     "-g", "--group",
@@ -296,9 +310,10 @@ def convert(
 @main.command()
 @click.option(
     "-m", "--meeting",
-    type=int,
+    type=str,
+    callback=_meeting_number,
     required=True,
-    help="IETF meeting number",
+    help="IETF meeting number, or interim name (interim-2026-vcon-02)",
 )
 @click.option(
     "-g", "--group",
@@ -351,9 +366,10 @@ def list_sessions(meeting: int, group: str | None):
 @main.command()
 @click.option(
     "-m", "--meeting",
-    type=int,
+    type=str,
+    callback=_meeting_number,
     required=True,
-    help="IETF meeting number",
+    help="IETF meeting number, or interim name (interim-2026-vcon-02)",
 )
 @click.option(
     "-g", "--group",
@@ -398,9 +414,10 @@ def list_materials(meeting: int, group: str):
 @main.command("convert-all")
 @click.option(
     "-m", "--meeting",
-    type=int,
+    type=str,
+    callback=_meeting_number,
     required=True,
-    help="IETF meeting number",
+    help="IETF meeting number, or interim name (interim-2026-vcon-02)",
 )
 @click.option(
     "-o", "--output-dir",

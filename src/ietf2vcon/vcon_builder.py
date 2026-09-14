@@ -53,10 +53,19 @@ class VConBuilder:
         self, meeting: IETFMeeting, session: IETFSession
     ) -> "VConBuilder":
         """Set metadata from IETF meeting and session."""
-        self.vcon.vcon_dict["subject"] = (
-            f"IETF {meeting.number} - {session.group_acronym.upper()} "
-            f"Working Group Session"
-        )
+        # A numbered meeting reads "IETF 124 - VCON Working Group Session".
+        # An interim's identifier is a name, not a number, so it is labelled
+        # as the interim it is rather than dropped into the same sentence.
+        if str(meeting.number).isdigit():
+            self.vcon.vcon_dict["subject"] = (
+                f"IETF {meeting.number} - {session.group_acronym.upper()} "
+                f"Working Group Session"
+            )
+        else:
+            self.vcon.vcon_dict["subject"] = (
+                f"IETF {session.group_acronym.upper()} Working Group Interim "
+                f"Session - {meeting.number}"
+            )
 
         # Add meeting metadata as attachment. body is a JSON *string*: the spec
         # requires a string body even when the content is JSON.
@@ -98,6 +107,11 @@ class VConBuilder:
         index = len(self.vcon.parties)
         self.vcon.add_party(party)
         self._party_map[key] = index
+        # `role` on a party comes from the role extension, so using it obliges
+        # the vCon to declare it. Without the declaration a reader is entitled
+        # to ignore the field, which would drop who chaired the session.
+        if role:
+            self.vcon.add_extension("role")
         return index
 
     def add_persons(self, persons: list[IETFPerson]) -> list[int]:
@@ -131,7 +145,7 @@ class VConBuilder:
         start_time = session.start_time or datetime.now(UTC)
 
         dialog = Dialog(
-            type="video",
+            type="recording",
             start=start_time,
             duration=video.duration_seconds or session.duration_seconds,
             parties=party_indices or list(range(len(self.vcon.parties))),
@@ -161,7 +175,7 @@ class VConBuilder:
         start_time = session.start_time or datetime.now(UTC)
 
         dialog = Dialog(
-            type="video",
+            type="recording",
             start=start_time,
             duration=session.duration_seconds,
             parties=party_indices or list(range(len(self.vcon.parties))),
@@ -193,7 +207,7 @@ class VConBuilder:
         start_time = session.start_time or datetime.now(UTC)
 
         dialog = Dialog(
-            type="video",
+            type="recording",
             start=start_time,
             duration=session.duration_seconds,
             parties=party_indices or list(range(len(self.vcon.parties))),
@@ -377,22 +391,40 @@ class VConBuilder:
             for i, seg in enumerate(transcript.segments)
         ]
 
-        self.vcon.add_wtf_transcription_attachment(
-            transcript={
+        # draft-howe-vcon-wtf-extension section 6.1: "Transcription analysis
+        # results MUST be stored as vCon analysis using the standard analysis
+        # object structure." The prose in section 10.2 of that draft says
+        # "attachment", which contradicts its own normative text and the
+        # examples; the analysis object is what this follows. vcon-lib's
+        # add_wtf_transcription_attachment() writes an attachment, so the
+        # analysis object is assembled here instead.
+        #
+        # vcon-core requires a string body, paired with encoding "json" when
+        # the content is JSON, and requires vendor on every analysis object.
+        body = {
+            "transcript": {
                 "text": transcript.text,
                 "language": transcript.language or "en",
                 "duration": transcript.duration or 0.0,
                 "confidence": avg_confidence,
             },
-            segments=segments,
-            metadata={
+            "segments": segments,
+            "metadata": {
                 "created_at": datetime.now(UTC).isoformat(),
                 "processed_at": datetime.now(UTC).isoformat(),
                 "provider": transcript.provider,
                 "model": transcript.model or "unknown",
             },
-            dialog_index=dialog_index,
+        }
+        self.vcon.add_analysis(
+            type="wtf_transcription",
+            dialog=dialog_index,
+            vendor=transcript.provider or "unknown",
+            product=transcript.model or None,
+            body=json_body(body),
+            encoding="json",
         )
+        self.vcon.add_extension("wtf_transcription")
         return self
 
     def add_analysis(
@@ -434,6 +466,7 @@ class VConBuilder:
         self,
         lawful_basis: str,
         purpose_grants: list[dict] | None = None,
+        proof_mechanisms: list[dict] | None = None,
         terms_of_service: str | None = None,
         terms_of_service_name: str | None = None,
         jurisdiction: str | None = None,
@@ -474,8 +507,15 @@ class VConBuilder:
         # wants a string, so normalize here rather than emit a body no
         # conforming reader should accept.
         attachment = self.vcon.vcon_dict["attachments"][-1]
-        if isinstance(attachment.get("body"), dict):
-            attachment["body"] = json_body(attachment["body"])
+        body = attachment.get("body")
+        if isinstance(body, dict):
+            # A basis with no proof_mechanisms[] is hollow: it asserts a basis
+            # without saying what evidences it. vcon-lib's helper has no
+            # parameter for the field, so it is set on the body before the
+            # body is serialized.
+            if proof_mechanisms:
+                body["proof_mechanisms"] = proof_mechanisms
+            attachment["body"] = json_body(body)
             attachment["encoding"] = "json"
         return self
 
@@ -493,6 +533,29 @@ class VConBuilder:
                 {"purpose": "publication", "status": "granted"},
                 {"purpose": "archival", "status": "granted"},
                 {"purpose": "analysis", "status": "granted"},
+            ],
+            # What actually evidences the basis: the Note Well is a published
+            # policy, and the Datatracker's own session record, including the
+            # bluesheets attachment carried by this vCon, is the record of the
+            # session having been held under it. Both are checkable by a third
+            # party, which is the point of the field.
+            proof_mechanisms=[
+                {
+                    "mechanism_type": "external_system",
+                    "description": (
+                        "IETF Note Well, the IETF's published policy for meeting "
+                        "participation, at https://www.ietf.org/about/note-well/. "
+                        "Participation in an IETF session constitutes agreement to it."
+                    ),
+                },
+                {
+                    "mechanism_type": "external_system",
+                    "description": (
+                        "IETF Datatracker session record, including the bluesheets "
+                        "attendance document referenced by this vCon, evidencing that "
+                        "the session was held and published under that policy."
+                    ),
+                },
             ],
             terms_of_service="https://www.ietf.org/about/note-well/",
             terms_of_service_name="IETF Note Well",

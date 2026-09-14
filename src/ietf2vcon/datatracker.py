@@ -14,7 +14,13 @@ from urllib.parse import urljoin
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from .models import IETFMaterial, IETFMeeting, IETFPerson, IETFSession
+from .models import (
+    IETFMaterial,
+    IETFMeeting,
+    IETFPerson,
+    IETFSession,
+    MeetingNumber,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +90,7 @@ class DataTrackerClient:
 
         return results
 
-    def get_meeting(self, meeting_number: int) -> IETFMeeting | None:
+    def get_meeting(self, meeting_number: MeetingNumber) -> IETFMeeting | None:
         """Get metadata for an IETF meeting by number."""
         try:
             data = self._get(f"/api/v1/meeting/meeting/", {"number": meeting_number})
@@ -105,7 +111,7 @@ class DataTrackerClient:
             return None
 
     def get_group_sessions(
-        self, meeting_number: int, group_acronym: str
+        self, meeting_number: MeetingNumber, group_acronym: str
     ) -> list[IETFSession] | None:
         """Get sessions for a specific working group at a meeting.
 
@@ -190,7 +196,7 @@ class DataTrackerClient:
 
         return sessions
 
-    def get_meeting_sessions(self, meeting_number: int) -> list[IETFSession]:
+    def get_meeting_sessions(self, meeting_number: MeetingNumber) -> list[IETFSession]:
         """Get all sessions for an IETF meeting.
 
         Note: This fetches sessions with minimal detail for listing purposes.
@@ -245,7 +251,7 @@ class DataTrackerClient:
         return sessions
 
     def get_session_materials(
-        self, meeting_number: int, group_acronym: str
+        self, meeting_number: MeetingNumber, group_acronym: str
     ) -> list[IETFMaterial]:
         """Get all materials (slides, agendas, etc.) for a session."""
         materials = []
@@ -524,13 +530,13 @@ class DataTrackerClient:
 
         return chairs
 
-    def get_recording_url(self, meeting_number: int, group_acronym: str) -> str | None:
+    def get_recording_url(self, meeting_number: MeetingNumber, group_acronym: str) -> str | None:
         """Get the Meetecho recording URL for a session."""
         # Meetecho recordings follow a predictable pattern
         # https://meetings.conf.meetecho.com/ietf{num}/?session={session-id}
         return f"https://meetings.conf.meetecho.com/ietf{meeting_number}/?group={group_acronym}"
 
-    def get_youtube_playlist_url(self, meeting_number: int) -> str:
+    def get_youtube_playlist_url(self, meeting_number: MeetingNumber) -> str:
         """Get the YouTube playlist URL for an IETF meeting."""
         return f"https://www.youtube.com/playlist?list=PLC86T-6ZTP5g-mLpb6ER0j63i8yD6dDNq"
 

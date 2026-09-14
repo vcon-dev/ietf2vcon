@@ -14,10 +14,16 @@ from pydantic import BaseModel
 # --- IETF Data Models ---
 
 
+# A meeting is identified either by number (124) or, for an interim, by the
+# Datatracker's meeting name (interim-2026-vcon-02). Both are what the API
+# takes in the `number` field, so both belong in this type.
+MeetingNumber = int | str
+
+
 class IETFMeeting(BaseModel):
     """IETF meeting metadata."""
 
-    number: int
+    number: MeetingNumber
     city: str | None = None
     country: str | None = None
     start_date: datetime | None = None
@@ -28,7 +34,7 @@ class IETFMeeting(BaseModel):
 class IETFSession(BaseModel):
     """IETF working group session."""
 
-    meeting_number: int
+    meeting_number: MeetingNumber
     group_acronym: str
     session_id: str
     name: str | None = None
