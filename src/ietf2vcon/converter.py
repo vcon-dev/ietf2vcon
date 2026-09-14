@@ -15,7 +15,7 @@ from vcon import Vcon
 
 from .datatracker import DataTrackerClient
 from .materials import MaterialsDownloader, organize_materials_by_type
-from .models import IETFMeeting, IETFSession
+from .models import IETFMeeting, IETFSession, MeetingNumber
 from .transcription import (
     MeetechoTranscriptLoader,
     MlxWhisperTranscriber,
@@ -96,7 +96,7 @@ class ConversionResult:
     """Result of an IETF session conversion."""
 
     vcon: Vcon
-    meeting_number: int
+    meeting_number: MeetingNumber
     group_acronym: str
     session_id: str
     video_url: str | None = None
@@ -116,7 +116,7 @@ class IETFSessionConverter:
 
     def convert_session(
         self,
-        meeting_number: int,
+        meeting_number: MeetingNumber,
         group_acronym: str,
         session_index: int = 0,
     ) -> ConversionResult:
@@ -134,7 +134,7 @@ class IETFSessionConverter:
         warnings = []
 
         logger.info(
-            "Converting IETF %d %s session %d",
+            "Converting IETF %s %s session %d",
             meeting_number, group_acronym, session_index,
         )
 
@@ -527,7 +527,7 @@ class IETFSessionConverter:
 
                 # Export to SRT/WebVTT if requested
                 base_filename = (
-                    f"ietf{session.meeting_number}_{session.group_acronym}"
+                    f"{self._meeting_slug(session.meeting_number)}_{session.group_acronym}"
                 )
 
                 if self.options.export_srt:
@@ -567,7 +567,7 @@ class IETFSessionConverter:
         logger.info("Fetching YouTube captions...")
         caption_path = youtube.download_captions(
             video_url,
-            output_filename=f"ietf{session.meeting_number}_{session.group_acronym}",
+            output_filename=f"{self._meeting_slug(session.meeting_number)}_{session.group_acronym}",
         )
 
         if not caption_path:
@@ -752,13 +752,26 @@ class IETFSessionConverter:
 
         return count
 
-    def _session_filename(self, meeting_number: int, group_acronym: str, session_id: str) -> str:
-        return f"ietf{meeting_number}_{group_acronym}_{session_id}.vcon.json"
+    @staticmethod
+    def _meeting_slug(meeting_number: MeetingNumber) -> str:
+        """Filename stem for a meeting.
+
+        "ietf" prefixes a bare number; an interim identifier already names the
+        meeting, so prefixing it would read "ietfinterim-2026-vcon-02".
+        """
+        return (
+            f"ietf{meeting_number}"
+            if str(meeting_number).isdigit()
+            else str(meeting_number)
+        )
+
+    def _session_filename(self, meeting_number: MeetingNumber, group_acronym: str, session_id: str) -> str:
+        return f"{self._meeting_slug(meeting_number)}_{group_acronym}_{session_id}.vcon.json"
 
     def _carry_over_previous(
         self,
         vcon: Vcon,
-        meeting_number: int,
+        meeting_number: MeetingNumber,
         group_acronym: str,
         session_id: str,
         warnings: list[str],

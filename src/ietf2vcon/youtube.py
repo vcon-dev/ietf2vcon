@@ -10,6 +10,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .models import MeetingNumber
+
 logger = logging.getLogger(__name__)
 
 IETF_YOUTUBE_CHANNEL = "https://www.youtube.com/@ietf"
@@ -38,7 +40,7 @@ class YouTubeResolver:
 
     def search_session_video(
         self,
-        meeting_number: int,
+        meeting_number: MeetingNumber,
         group_acronym: str,
         session_date: str | None = None,
     ) -> VideoMetadata | None:
@@ -52,6 +54,19 @@ class YouTubeResolver:
         Returns:
             VideoMetadata if found, None otherwise
         """
+        # Interim sessions are not published to the per-meeting "IETF <n>"
+        # playlists this search walks, so there is nothing here to find. The
+        # recording is instead carried as a recording document on the session,
+        # which the converter falls through to. Searching anyway just spends a
+        # yt-dlp pass on every playlist to return None.
+        if not str(meeting_number).isdigit():
+            logger.info(
+                "Meeting %s is not a numbered meeting; skipping the YouTube "
+                "playlist search and relying on the session's recording document",
+                meeting_number,
+            )
+            return None
+
         # Build search query
         search_terms = [f"IETF {meeting_number}", group_acronym.upper()]
         if session_date:
@@ -260,7 +275,7 @@ class YouTubeResolver:
             return None
 
     def get_meetecho_recording_url(
-        self, meeting_number: int, group_acronym: str
+        self, meeting_number: MeetingNumber, group_acronym: str
     ) -> str:
         """Generate the Meetecho recording URL for a session.
 
@@ -400,7 +415,7 @@ class YouTubeResolver:
             return []
 
     def _title_matches_session(
-        self, title: str, meeting_number: int, group_acronym: str
+        self, title: str, meeting_number: MeetingNumber, group_acronym: str
     ) -> bool:
         """Check if a video title matches the session we're looking for."""
         title_lower = title.lower()
