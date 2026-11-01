@@ -137,13 +137,13 @@ class TestVConBuilderDialogs:
         # vcon-core dialog types are recording/text/transfer/incomplete.
         # "video" is not one of them; the media type carries the video-ness.
         assert vcon.dialog[0]["type"] == "recording"
-        # core-05: url needs a content_hash we cannot compute for a watch
-        # page, so the recording is an inline link and the real media type
-        # lives in meta.
-        assert vcon.dialog[0]["mediatype"] == "text/uri-list"
-        assert vcon.dialog[0]["body"] == sample_video_metadata.url
-        assert "url" not in vcon.dialog[0]
-        assert vcon.dialog[0]["meta"]["recording_mediatype"] == "video/mp4"
+        # Linked recording: url + mediatype, no content_hash, no meta (core-05
+        # defines no Dialog meta). Known departure pending WG issue #40.
+        assert vcon.dialog[0]["mediatype"] == "video/mp4"
+        assert vcon.dialog[0]["url"] == sample_video_metadata.url
+        assert "content_hash" not in vcon.dialog[0]
+        assert "body" not in vcon.dialog[0]
+        assert "meta" not in vcon.dialog[0]
 
     def test_add_video_dialog_from_url(self, sample_ietf_session):
         """Test adding video dialog from URL."""
@@ -154,9 +154,24 @@ class TestVConBuilderDialogs:
         )
         vcon = builder.build()
 
-        assert vcon.dialog[idx]["body"] == "https://youtube.com/watch?v=abc123"
-        assert "url" not in vcon.dialog[idx]
-        assert vcon.dialog[idx]["type"] == "recording"
+        d = vcon.dialog[idx]
+        assert d["url"] == "https://youtube.com/watch?v=abc123"
+        assert d["mediatype"] == "video/mp4"
+        assert d["type"] == "recording"
+        assert not ({"content_hash", "body", "encoding", "meta"} & d.keys())
+
+    def test_add_audio_recording_from_url(self, sample_ietf_session):
+        """Older meetings link an MP3; the pre-port audio/mpeg type is kept."""
+        builder = VConBuilder()
+        idx = builder.add_video_dialog_from_url(
+            url="https://www.ietf.org/audio/ietf90/ietf90-room1-20140721-1300.mp3",
+            session=sample_ietf_session,
+            mimetype="audio/mpeg",
+        )
+        d = builder.build().dialog[idx]
+        assert d["mediatype"] == "audio/mpeg"
+        assert d["url"].endswith(".mp3")
+        assert not ({"content_hash", "body", "encoding", "meta"} & d.keys())
 
     def test_add_chat_dialog(self, sample_chat_messages, sample_ietf_session):
         """Test adding chat dialog."""

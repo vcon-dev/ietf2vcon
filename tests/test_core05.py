@@ -148,3 +148,81 @@ def test_wtf_server_payload_is_core05():
 
     src = inspect.getsource(transcription)
     assert '"vcon": "0.5.0"' in src and '"vcon": "0.4.0"' not in src
+
+
+# ---- known deviation: recording url without content_hash (WG issue #40) ----
+
+def _vcon_with(dialog=None, attachment=None):
+    data = {
+        "vcon": "0.5.0", "uuid": "018f2c3e-7b1a-8c4d-9e2f-0a1b2c3d4e5f",
+        "created_at": "2025-01-01T00:00:00Z",
+        "parties": [{"name": "a"}],
+        "sessions": [{"start": "2025-01-01T00:00:00Z", "dialog": [0]}],
+        "dialog": [dialog or {
+            "type": "recording", "start": "2025-01-01T00:00:00Z", "parties": [0],
+            "mediatype": "video/mp4", "url": "https://www.youtube.com/watch?v=abc",
+        }],
+    }
+    if attachment:
+        data["attachments"] = [attachment]
+    return data
+
+
+def _run(validator, tmp_path, data):
+    path = tmp_path / "k.vcon.json"
+    path.write_text(json.dumps(data))
+    ok, errors, _ = validator.validate_file(path)
+    return ok, errors, list(validator.known_deviations)
+
+
+def test_recording_dialog_has_url_no_hash_no_meta(
+    sample_ietf_meeting, sample_ietf_session, sample_video_metadata
+):
+    b = VConBuilder()
+    b.set_meeting_metadata(sample_ietf_meeting, sample_ietf_session)
+    b.add_attendees_party()
+    b.add_video_dialog(sample_video_metadata, sample_ietf_session)
+    d = b.build().vcon_dict["dialog"][0]
+    assert d["url"] == sample_video_metadata.url
+    assert "content_hash" not in d and "meta" not in d
+
+
+def test_validator_passes_only_known_deviation(validator, tmp_path):
+    ok, errors, known = _run(validator, tmp_path, _vcon_with())
+    assert ok and errors == []
+    assert len(known) == 1 and "dialog/0" in known[0]
+
+
+@pytest.mark.parametrize("url", [
+    "https://youtu.be/abc",
+    "https://www.ietf.org/audio/ietf90/room1.mp3",
+])
+def test_known_deviation_recording_hosts(validator, tmp_path, url):
+    d = {"type": "recording", "start": "2025-01-01T00:00:00Z", "parties": [0],
+         "mediatype": "audio/mpeg", "url": url}
+    ok, _, known = _run(validator, tmp_path, _vcon_with(dialog=d))
+    assert ok and len(known) == 1
+
+
+def test_validator_fails_url_without_hash_on_non_recording_url(validator, tmp_path):
+    d = {"type": "recording", "start": "2025-01-01T00:00:00Z", "parties": [0],
+         "mediatype": "video/mp4", "url": "https://example.com/rec.mp4"}
+    ok, errors, known = _run(validator, tmp_path, _vcon_with(dialog=d))
+    assert not ok and known == []
+    assert any("content_hash" in e for e in errors)
+
+
+def test_validator_fails_url_without_hash_on_attachment(validator, tmp_path):
+    att = {"purpose": "x", "party": 0, "session": 0,
+           "mediatype": "text/html", "url": "https://www.youtube.com/watch?v=abc"}
+    ok, errors, known = _run(validator, tmp_path, _vcon_with(attachment=att))
+    assert not ok
+    assert any("attachments" in e and "content_hash" in e for e in errors)
+    assert len(known) == 1  # the dialog still reports; the attachment fails
+
+
+def test_validator_fails_known_deviation_plus_other_error(validator, tmp_path):
+    data = _vcon_with()
+    data["dialog"][0]["type"] = "bogus"
+    ok, errors, _ = _run(validator, tmp_path, data)
+    assert not ok and errors

@@ -28,6 +28,33 @@ from rich.table import Table
 
 console = Console()
 
+WG_ISSUE_URL = (
+    "https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40"
+)
+KNOWN_DEVIATION_LABEL = (
+    "recording Dialog url (YouTube / IETF recording) without content_hash"
+)
+_YOUTUBE_HOSTS = {"youtube.com", "youtu.be"}
+_IETF_RECORDING_PATH = re.compile(r"/audio/|recording|\.(mp3|m4a|mp4|webm)$", re.I)
+
+
+def is_recording_link(url: Any) -> bool:
+    """True for a YouTube or IETF meeting-recording URL (no stable bytes to hash)."""
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    def under(domain: str) -> bool:
+        return host == domain or host.endswith("." + domain)
+
+    if any(under(d) for d in _YOUTUBE_HOSTS):
+        return True
+    if under("meetecho.com"):
+        return True
+    return under("ietf.org") and bool(_IETF_RECORDING_PATH.search(parsed.path))
+
+
 SCHEMA_PATH = Path(__file__).parent / "schemas" / "appendix-c-json-schema.json"
 
 
@@ -41,11 +68,13 @@ class VConValidator:
         self._schema_validator = jsonschema.Draft7Validator(self.schema)
         self.errors: list[str] = []
         self.warnings: list[str] = []
+        self.known_deviations: list[str] = []
 
     def reset(self):
-        """Reset errors and warnings for a new validation."""
+        """Reset errors, warnings and known deviations for a new validation."""
         self.errors = []
         self.warnings = []
+        self.known_deviations = []
 
     def error(self, msg: str):
         """Record an error."""
@@ -90,7 +119,35 @@ class VConValidator:
             self._schema_validator.iter_errors(data), key=lambda e: list(e.absolute_path)
         ):
             where = "/".join(str(p) for p in err.absolute_path) or "(root)"
+            if self._is_known_deviation(data, err):
+                self.known_deviations.append(f"{where}: {KNOWN_DEVIATION_LABEL}")
+                continue
             self.error(f"Schema: {where}: {err.message[:200]}")
+
+    @staticmethod
+    def _is_known_deviation(data: Any, err: "jsonschema.ValidationError") -> bool:
+        """The one tolerated error: url without content_hash on a recording link.
+
+        Only a ``dependencies`` failure for ``content_hash`` on a Dialog of
+        type recording whose url is a YouTube or IETF recording URL. An
+        attachment, a non-recording dialog or any other URL stays a failure.
+        See WG issue #40.
+        """
+        path = list(err.absolute_path)
+        if err.validator != "dependencies" or len(path) != 2 or path[0] != "dialog":
+            return False
+        if "'content_hash' is a dependency of 'url'" not in err.message:
+            return False
+        try:
+            dialog = data["dialog"][path[1]]
+        except (KeyError, IndexError, TypeError):
+            return False
+        return (
+            isinstance(dialog, dict)
+            and dialog.get("type") == "recording"
+            and "content_hash" not in dialog
+            and is_recording_link(dialog.get("url"))
+        )
 
     def _validate_sessions(self, data: dict[str, Any]):
         """Core-05 wiring the schema cannot express: index bounds and scoping."""
@@ -458,7 +515,9 @@ def main():
 
     for path in sorted(selected):
         success, errors, warnings = validator.validate_file(path)
-        results.append((path.name, success, errors, warnings))
+        results.append(
+            (path.name, success, errors, warnings, validator.known_deviations.copy())
+        )
 
     # Display results
     table = Table(title="Validation Results")
@@ -470,8 +529,10 @@ def main():
     total_errors = 0
     total_warnings = 0
     failed_files = 0
+    total_known = sum(len(k) for *_, k in results)
+    files_known = sum(1 for *_, k in results if k)
 
-    for name, success, errors, warnings in results:
+    for name, success, errors, warnings, _known in results:
         status = "[green]✓[/green]" if success else "[red]✗[/red]"
         error_count = str(len(errors)) if errors else "-"
         warning_count = str(len(warnings)) if warnings else "-"
@@ -492,11 +553,16 @@ def main():
     console.print(f"  Failed: [red]{failed_files}[/red]")
     console.print(f"  Total errors: [red]{total_errors}[/red]")
     console.print(f"  Total warnings: [yellow]{total_warnings}[/yellow]")
+    console.print(
+        f"  Known deviations (not failures): [yellow]{total_known}[/yellow]"
+        f" in {files_known} file(s); {KNOWN_DEVIATION_LABEL}."
+        f" See {WG_ISSUE_URL}"
+    )
 
     # Show detailed errors if verbose or if there are failures
     if args.verbose or failed_files > 0:
         console.print("\n[bold]Details:[/bold]")
-        for name, success, errors, warnings in results:
+        for name, success, errors, warnings, _known in results:
             if errors or (args.verbose and warnings):
                 console.print(f"\n[cyan]{name}[/cyan]")
                 for e in errors:

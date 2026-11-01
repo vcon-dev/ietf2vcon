@@ -17,17 +17,27 @@ Port to vCon core-05 (syntax "0.5.0"). Requires `vcon>=1.0.0,<2`.
   party plus session.
 - Transcript analysis points at the recording Dialog, or at the Session when
   the vCon has no Dialog.
-- Recordings that are only linked (YouTube watch page, ietf.org MP3) are an
-  inline `text/uri-list` link with the real media type in
-  `meta.recording_mediatype`. core-05 allows `url` only with a `content_hash`,
-  and no honest hash exists for a page or an unfetched file.
+- Recordings that are only linked (YouTube watch page, ietf.org MP3,
+  Meetecho) are Dialogs with `url` and `mediatype` (`video/mp4`, or
+  `audio/mpeg` for MP3), as before the port. They carry no `content_hash`
+  because none can honestly be computed for a mutable page or an unfetched,
+  login-gated file, and no Dialog `meta` (core-05 defines none). This departs
+  from core-05 Section 2.4 and the Appendix C `url -> content_hash`
+  dependency, pending WG issue
+  https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40.
+  Bytes that are actually fetched are hashed for real (SHA-512).
 - Regeneration carry-over migrates a previous 0.4.0 file with the reference
   library before reusing its dialog and analysis, and lists carried dialog in
   the Session.
 - The WTF server request is built as a 0.5.0 vCon with a Session.
 - `scripts/validate_vcons.py` validates against the vendored core-05
   Appendix C JSON Schema (`scripts/schemas/appendix-c-json-schema.json`) and
-  checks Session wiring, attachment scope and lawful basis scoping.
+  checks Session wiring, attachment scope and lawful basis scoping. The one
+  error "url without content_hash on a recording Dialog whose url is YouTube
+  or an IETF recording" is reported separately as a known deviation (count
+  plus a pointer to WG issue #40) and does not fail a file. Every other
+  schema error, including url without content_hash on an attachment or on any
+  other URL, still fails.
 
 ### Not emitted
 

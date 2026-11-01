@@ -224,6 +224,20 @@ This tool implements several vCon extensions:
 | Materials | Datatracker | https://datatracker.ietf.org/meeting/{num}/materials/ |
 | Chat Logs | Zulip | https://zulip.ietf.org/ |
 
+
+## Known deviation: recording links carry no content_hash
+
+Linked recordings (YouTube watch pages, ietf.org audio, Meetecho) are Dialogs
+with `url` and `mediatype` and no `content_hash`. None can honestly be
+computed: a watch page is mutable HTML and the audio files are login-gated or
+not fetched. This departs from vCon core-05 Section 2.4 (and the Appendix C
+`url -> content_hash` dependency) pending WG issue
+https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40. No hash is
+ever invented; recording bytes that are actually fetched get a real SHA-512.
+`scripts/validate_vcons.py` validates against the vendored Appendix C schema
+and reports this one case as a known deviation with a count, not a failure.
+Any other schema error still fails.
+
 ## Zulip Chat Integration
 
 To include chat logs, you need IETF Zulip credentials:

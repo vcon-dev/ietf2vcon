@@ -9,6 +9,14 @@ Session Object (sessions[0]). The recording and the chat log are Dialogs that
 the Session lists; every attachment is scoped with a party plus that Session
 (or, for a transcript, the Dialog it describes). The Datatracker and Meetecho
 give no join or drop times, so no Events are emitted.
+
+Known deviation: linked recordings (YouTube watch pages, ietf.org audio,
+Meetecho) are Dialogs with ``url`` and no ``content_hash``. Their bytes are not
+stable or not fetchable, so no honest hash exists. core-05 Section 2.4 and
+Appendix C require ``content_hash`` beside ``url``; this departs from that
+pending WG issue
+https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40.
+scripts/validate_vcons.py reports it as a known deviation, not a failure.
 """
 
 import base64
@@ -158,26 +166,21 @@ class VConBuilder:
             meta={"count": count} if count else None,
         )
 
-    @staticmethod
-    def _link_content(url: str) -> dict[str, Any]:
-        """Dialog content for a recording that is only linked, not fetched.
-
-        core-05 allows ``url`` only with a ``content_hash`` of the bytes it
-        serves. A YouTube watch page is mutable HTML and the recording files
-        are never downloaded here, so no honest hash exists. The recording is
-        therefore carried as an inline link (``text/uri-list``), the same
-        choice made for landing-page attachments; the real media type of the
-        target is recorded in ``meta.recording_mediatype``.
-        """
-        return {"mediatype": "text/uri-list", "body": url, "encoding": "none"}
-
     def add_video_dialog(
         self,
         video: VideoMetadata,
         session: IETFSession,
         party_indices: list[int] | None = None,
     ) -> int:
-        """Add video recording as a dialog. Returns dialog index."""
+        """Add a linked video recording as a dialog. Returns dialog index.
+
+        The dialog carries ``url`` and ``mediatype`` only. It has NO
+        ``content_hash``: a YouTube watch page is mutable HTML, so no honest
+        hash exists. This departs from vCon core-05 Section 2.4 (and the
+        Appendix C ``url -> content_hash`` dependency) pending WG issue
+        https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40.
+        No Dialog ``meta`` is written either: core-05 defines none.
+        """
         start_time = session.start_time or datetime.now(UTC)
 
         dialog = Dialog(
@@ -185,15 +188,8 @@ class VConBuilder:
             start=start_time,
             duration=video.duration_seconds or session.duration_seconds,
             parties=party_indices or list(range(len(self.vcon.parties))),
-            **self._link_content(video.url),
-            meta={
-                "recording_mediatype": "video/mp4",
-                "source": "youtube",
-                "video_id": video.video_id,
-                "title": video.title,
-                "ietf_meeting": session.meeting_number,
-                "working_group": session.group_acronym,
-            },
+            mediatype="video/mp4",
+            url=video.url,
         )
 
         index = len(self.vcon.dialog)
@@ -207,7 +203,12 @@ class VConBuilder:
         mimetype: str = "video/mp4",
         party_indices: list[int] | None = None,
     ) -> int:
-        """Add video dialog from a URL (YouTube or Meetecho)."""
+        """Add a linked recording (YouTube, Meetecho, ietf.org MP3) from a URL.
+
+        ``url`` and ``mediatype`` only; no ``content_hash`` (none can honestly
+        be computed for these targets), a known departure from core-05
+        Section 2.4 pending WG issue #40. No Dialog ``meta``.
+        """
         start_time = session.start_time or datetime.now(UTC)
 
         dialog = Dialog(
@@ -215,12 +216,8 @@ class VConBuilder:
             start=start_time,
             duration=session.duration_seconds,
             parties=party_indices or list(range(len(self.vcon.parties))),
-            **self._link_content(url),
-            meta={
-                "recording_mediatype": mimetype,
-                "ietf_meeting": session.meeting_number,
-                "working_group": session.group_acronym,
-            },
+            mediatype=mimetype,
+            url=url,
         )
 
         index = len(self.vcon.dialog)
