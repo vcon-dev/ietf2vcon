@@ -734,6 +734,8 @@ class IETFSessionConverter:
 
                         builder.vcon.add_attachment(
                             purpose="chat_log",
+                            party=builder.attachment_party,
+                            session=builder.session_index,
                             body=chat_messages_to_json(messages),
                             encoding="none",
                         )
@@ -797,6 +799,18 @@ class IETFSessionConverter:
             logger.warning("Could not read %s to carry its content over: %s", existing, e)
             return
 
+        if previous.get("vcon") != "0.5.0":
+            # A file written before the port is 0.4.0. Migrate it with the
+            # reference library so carried dialog and analysis have the
+            # 0.5.0 shape (Sessions, recording-only dialog types).
+            try:
+                from vcon.migration import migrate_0_4_0_to_0_5_0
+
+                previous = migrate_0_4_0_to_0_5_0(previous).vcon
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not migrate %s to 0.5.0: %s", existing, e)
+                previous = {"uuid": previous.get("uuid")}
+
         if self.options.preserve_uuid:
             previous_uuid = previous.get("uuid")
             if previous_uuid and previous_uuid != vcon.vcon_dict.get("uuid"):
@@ -825,6 +839,10 @@ class IETFSessionConverter:
         if not dialog and previous.get("dialog"):
             dialog = previous["dialog"]
             vcon.vcon_dict["dialog"] = dialog
+            # core-05: the Session lists its Dialogs.
+            sessions = vcon.vcon_dict.get("sessions") or []
+            if sessions:
+                sessions[0]["dialog"] = list(range(len(dialog)))
 
         carried, dangling = [], 0
         for analysis in previous_analysis:

@@ -207,8 +207,11 @@ class WtfServerTranscriber:
 
             # Build minimal vCon with inline audio
             vcon_payload = {
-                "vcon": "0.4.0",
+                "vcon": "0.5.0",
                 "parties": [{"name": "speaker"}],
+                "sessions": [
+                    {"start": "2024-01-01T00:00:00Z", "parties": [0], "dialog": [0]}
+                ],
                 "dialog": [
                     {
                         "type": "recording",

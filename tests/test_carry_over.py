@@ -112,3 +112,11 @@ def test_first_generation_has_nothing_to_carry(converter, tmp_path):
     carry(converter, vcon)
 
     assert not vcon.vcon_dict.get("analysis")
+
+
+def test_carried_dialog_is_listed_by_the_session(converter, published):
+    """core-05: a Session lists its Dialogs, so adopted dialog joins sessions[0]."""
+    vcon = VConBuilder().build()
+    carry(converter, vcon)
+
+    assert vcon.vcon_dict["sessions"][0]["dialog"] == [0]

@@ -3,6 +3,12 @@
 Constructs vCon objects from IETF session data including video, materials,
 transcripts, and chat logs. Uses vcon-lib (the ``vcon`` package) for core
 vCon construction, WTF transcription, and lawful basis extensions.
+
+Output is vCon core-05 (syntax "0.5.0"). One IETF meeting session is one
+Session Object (sessions[0]). The recording and the chat log are Dialogs that
+the Session lists; every attachment is scoped with a party plus that Session
+(or, for a transcript, the Dialog it describes). The Datatracker and Meetecho
+give no join or drop times, so no Events are emitted.
 """
 
 import base64
@@ -15,6 +21,7 @@ from typing import Any
 from vcon import Vcon
 from vcon.party import Party
 from vcon.dialog import Dialog
+from vcon.session import Session
 
 from . import __version__
 from .hashing import content_hash_token
@@ -43,6 +50,14 @@ class VConBuilder:
     def __init__(self):
         self.vcon = Vcon.build_new()
         self._party_map: dict[str, int] = {}  # email/name -> party index
+        # One IETF session is one core-05 Session. It is created up front so
+        # every dialog and attachment has something to be scoped to; start and
+        # duration are filled in by set_meeting_metadata().
+        self.session_index: int = self.vcon.add_session(Session())
+        # Party recorded as the author of vCon-level attachments (the lawful
+        # basis, metadata, ingress info). Index 0 is the first chair when
+        # chairs are known, otherwise the attendees party.
+        self.attachment_party: int = 0
 
     def set_subject(self, subject: str) -> "VConBuilder":
         """Set the vCon subject."""
@@ -67,10 +82,18 @@ class VConBuilder:
                 f"Session - {meeting.number}"
             )
 
+        session_dict = self.vcon.vcon_dict["sessions"][self.session_index]
+        if session.start_time:
+            session_dict["start"] = session.start_time.isoformat()
+        if session.duration_seconds:
+            session_dict["duration"] = session.duration_seconds
+
         # Add meeting metadata as attachment. body is a JSON *string*: the spec
         # requires a string body even when the content is JSON.
         self.vcon.add_attachment(
             purpose="meeting_metadata",
+            party=self.attachment_party,
+            session=self.session_index,
             encoding="json",
             body=json_body({
                 "ietf_meeting_number": meeting.number,
@@ -135,6 +158,19 @@ class VConBuilder:
             meta={"count": count} if count else None,
         )
 
+    @staticmethod
+    def _link_content(url: str) -> dict[str, Any]:
+        """Dialog content for a recording that is only linked, not fetched.
+
+        core-05 allows ``url`` only with a ``content_hash`` of the bytes it
+        serves. A YouTube watch page is mutable HTML and the recording files
+        are never downloaded here, so no honest hash exists. The recording is
+        therefore carried as an inline link (``text/uri-list``), the same
+        choice made for landing-page attachments; the real media type of the
+        target is recorded in ``meta.recording_mediatype``.
+        """
+        return {"mediatype": "text/uri-list", "body": url, "encoding": "none"}
+
     def add_video_dialog(
         self,
         video: VideoMetadata,
@@ -149,9 +185,9 @@ class VConBuilder:
             start=start_time,
             duration=video.duration_seconds or session.duration_seconds,
             parties=party_indices or list(range(len(self.vcon.parties))),
-            mediatype="video/mp4",
-            url=video.url,
+            **self._link_content(video.url),
             meta={
+                "recording_mediatype": "video/mp4",
                 "source": "youtube",
                 "video_id": video.video_id,
                 "title": video.title,
@@ -161,7 +197,7 @@ class VConBuilder:
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
         return index
 
     def add_video_dialog_from_url(
@@ -179,16 +215,16 @@ class VConBuilder:
             start=start_time,
             duration=session.duration_seconds,
             parties=party_indices or list(range(len(self.vcon.parties))),
-            mediatype=mimetype,
-            url=url,
+            **self._link_content(url),
             meta={
+                "recording_mediatype": mimetype,
                 "ietf_meeting": session.meeting_number,
                 "working_group": session.group_acronym,
             },
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
         return index
 
     def add_video_dialog_inline(
@@ -218,7 +254,7 @@ class VConBuilder:
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
         return index
 
     def add_chat_dialog(
@@ -257,7 +293,7 @@ class VConBuilder:
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
 
         # If JSON format, set body as dict after creation
         if not as_text:
@@ -289,6 +325,8 @@ class VConBuilder:
         if inline and content:
             self.vcon.add_attachment(
                 purpose=material.type,
+                party=self.attachment_party,
+                session=self.session_index,
                 body=base64.urlsafe_b64encode(content).decode("ascii"),
                 encoding="base64url",
                 mediatype=material.mimetype,
@@ -304,6 +342,8 @@ class VConBuilder:
             # is kept alongside.
             self.vcon.add_attachment(
                 purpose=material.type,
+                party=self.attachment_party,
+                session=self.session_index,
                 url=material.file_url or material.url,
                 content_hash=content_hash_token(content),
                 mediatype=material.mimetype,
@@ -324,6 +364,8 @@ class VConBuilder:
             # across the whole published corpus.
             self.vcon.add_attachment(
                 purpose=material.type,
+                party=self.attachment_party,
+                session=self.session_index,
                 body=json.dumps(
                     {
                         "url": material.url,
@@ -368,6 +410,12 @@ class VConBuilder:
                     material.filename = filename
             self.add_material_attachment(material, content=content, inline=inline)
         return self
+
+    def _analysis_scope(self, dialog_index: int | None) -> dict[str, Any]:
+        """What an analysis describes: a Dialog if there is one, else the Session."""
+        if dialog_index is not None and 0 <= dialog_index < len(self.vcon.dialog):
+            return {"dialog": dialog_index}
+        return {"sessions": self.session_index}
 
     def add_transcript(
         self,
@@ -418,7 +466,7 @@ class VConBuilder:
         }
         self.vcon.add_analysis(
             type="wtf_transcription",
-            dialog=dialog_index,
+            **self._analysis_scope(dialog_index),
             vendor=transcript.provider or "unknown",
             product=transcript.model or None,
             body=json_body(body),
@@ -437,7 +485,7 @@ class VConBuilder:
         """Add generic analysis data."""
         self.vcon.add_analysis(
             type=analysis_type,
-            dialog=dialog_index if dialog_index is not None else 0,
+            **self._analysis_scope(dialog_index),
             vendor=vendor or "unknown",
             body=body,
             encoding="json" if isinstance(body, dict) else "none",
@@ -452,6 +500,8 @@ class VConBuilder:
         """Add ingress (source) information attachment."""
         self.vcon.add_attachment(
             purpose="ingress_info",
+            party=self.attachment_party,
+            session=self.session_index,
             encoding="json",
             body=json_body({
                 "source": source,
@@ -502,6 +552,8 @@ class VConBuilder:
             purpose_grants=grants,
             terms_of_service=terms_of_service,
             metadata=meta if meta else None,
+            party_index=self.attachment_party,
+            session_index=self.session_index,
         )
         # vcon-lib's extension helper leaves the body as an object. The spec
         # wants a string, so normalize here rather than emit a body no
@@ -571,24 +623,25 @@ class VConBuilder:
     def build(self) -> Vcon:
         """Build and return the final vCon."""
         self.vcon.vcon_dict["updated_at"] = datetime.now(UTC).isoformat()
-        self._complete_attachments()
+        self._finish_session()
         return self.vcon
 
-    def _complete_attachments(self) -> None:
-        """Fill in the attachment fields core-02 requires.
+    def _finish_session(self) -> None:
+        """Fill in the Session's receivers and originator.
 
-        `party`, `dialog` and `start` are required on every attachment. These
-        are vCon-level attachments -- they describe the session, not one
-        speaker's contribution -- so the convention is party 0, dialog 0 and
-        the vCon's own created_at. Applied at build time so attachments added
-        by vcon-lib extensions are covered too.
+        Parties are added chairs first, then the attendees party, so the first
+        party is the organizer when one is known and is the implied originator
+        (core-05 4.2.4); ``originator`` is therefore never written. With no
+        chair known the attendees party is first and, by the same rule, is the
+        implied originator: the Datatracker names no one else. Receivers are
+        every party in the vCon.
         """
-        created_at = self.vcon.vcon_dict.get("created_at")
-        for attachment in self.vcon.vcon_dict.get("attachments") or []:
-            attachment.setdefault("party", 0)
-            attachment.setdefault("dialog", 0)
-            if created_at:
-                attachment.setdefault("start", created_at)
+        session = self.vcon.vcon_dict["sessions"][self.session_index]
+        count = len(self.vcon.parties)
+        if count:
+            session["parties"] = list(range(count))
+        else:
+            session.pop("parties", None)
 
     def to_json(self, indent: int = 2) -> str:
         """Build and serialize to JSON."""
