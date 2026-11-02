@@ -183,8 +183,9 @@ class TestVConBuilderDialogs:
 
         assert idx == 0
         assert vcon.dialog[0]["type"] == "text"
-        assert vcon.dialog[0]["meta"]["source"] == "zulip"
-        assert vcon.dialog[0]["meta"]["message_count"] == 2
+        # core-05 defines no Dialog meta, so none is written.
+        assert "meta" not in vcon.dialog[0]
+        assert "Great presentation!" in vcon.dialog[0]["body"]
 
     def test_add_chat_dialog_empty(self, sample_ietf_session):
         """Test adding empty chat dialog returns -1."""

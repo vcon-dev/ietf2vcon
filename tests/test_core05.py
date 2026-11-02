@@ -187,6 +187,15 @@ def test_recording_dialog_has_url_no_hash_no_meta(
     assert "content_hash" not in d and "meta" not in d
 
 
+def test_chat_dialog_has_no_meta(sample_ietf_meeting, sample_ietf_session, sample_chat_messages):
+    b = VConBuilder()
+    b.set_meeting_metadata(sample_ietf_meeting, sample_ietf_session)
+    b.add_attendees_party()
+    i = b.add_chat_dialog(sample_chat_messages, sample_ietf_session)
+    d = b.build().vcon_dict["dialog"][i]
+    assert d["type"] == "text" and "meta" not in d
+
+
 def test_validator_passes_only_known_deviation(validator, tmp_path):
     ok, errors, known = _run(validator, tmp_path, _vcon_with())
     assert ok and errors == []

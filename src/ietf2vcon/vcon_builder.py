@@ -260,7 +260,10 @@ class VConBuilder:
         session: IETFSession,
         as_text: bool = True,
     ) -> int:
-        """Add chat log as a text dialog. Returns dialog index."""
+        """Add chat log as a text dialog. Returns dialog index.
+
+        No Dialog ``meta`` is written: core-05 defines none.
+        """
         if not messages:
             return -1
 
@@ -280,13 +283,6 @@ class VConBuilder:
             mediatype=mimetype,
             body=body if isinstance(body, str) else None,
             encoding="none",
-            meta={
-                "source": "zulip",
-                "stream": messages[0].stream if messages else None,
-                "message_count": len(messages),
-                "ietf_meeting": session.meeting_number,
-                "working_group": session.group_acronym,
-            },
         )
 
         index = len(self.vcon.dialog)
