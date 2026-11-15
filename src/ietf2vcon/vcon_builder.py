@@ -3,6 +3,20 @@
 Constructs vCon objects from IETF session data including video, materials,
 transcripts, and chat logs. Uses vcon-lib (the ``vcon`` package) for core
 vCon construction, WTF transcription, and lawful basis extensions.
+
+Output is vCon core-05 (syntax "0.5.0"). One IETF meeting session is one
+Session Object (sessions[0]). The recording and the chat log are Dialogs that
+the Session lists; every attachment is scoped with a party plus that Session
+(or, for a transcript, the Dialog it describes). The Datatracker and Meetecho
+give no join or drop times, so no Events are emitted.
+
+Known deviation: linked recordings (YouTube watch pages, ietf.org audio,
+Meetecho) are Dialogs with ``url`` and no ``content_hash``. Their bytes are not
+stable or not fetchable, so no honest hash exists. core-05 Section 2.4 and
+Appendix C require ``content_hash`` beside ``url``; this departs from that
+pending WG issue
+https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40.
+scripts/validate_vcons.py reports it as a known deviation, not a failure.
 """
 
 import base64
@@ -11,12 +25,15 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote, urlparse
 
 from vcon import Vcon
 from vcon.party import Party
 from vcon.dialog import Dialog
+from vcon.session import Session
 
 from . import __version__
+from .datatracker import MET_STATUS
 from .hashing import content_hash_token
 from .models import (
     ChatMessage,
@@ -43,6 +60,28 @@ class VConBuilder:
     def __init__(self):
         self.vcon = Vcon.build_new()
         self._party_map: dict[str, int] = {}  # email/name -> party index
+        # One IETF session is one core-05 Session. It is created up front so
+        # every dialog and attachment has something to be scoped to; start and
+        # duration are filled in by set_meeting_metadata().
+        self.session_index: int = self.vcon.add_session(Session())
+        # Party recorded as the author of vCon-level attachments (the lawful
+        # basis, metadata, ingress info). Index 0 is the first chair when
+        # chairs are known, otherwise the attendees party.
+        self.attachment_party: int = 0
+        # The meeting_metadata body is a JSON string, so it is rewritten whenever
+        # something is added to it (see _write_meeting_metadata).
+        self._meeting_metadata: dict[str, Any] | None = None
+        self._meeting_metadata_index: int | None = None
+        self._materials_info: list[dict[str, Any]] = []
+        # When the session started, as the value given to grants' granted_at.
+        self._session_start: datetime | None = None
+        # The session's status slug, or None when unknown.
+        self._session_status: str | None = None
+        # The lawful basis attachment's position and its two proof entries; which
+        # of them the file may carry is settled in build(), once every attachment
+        # is known.
+        self._lawful_basis_index: int | None = None
+        self._lawful_proofs: list[dict] = []
 
     def set_subject(self, subject: str) -> "VConBuilder":
         """Set the vCon subject."""
@@ -67,32 +106,70 @@ class VConBuilder:
                 f"Session - {meeting.number}"
             )
 
+        session_dict = self.vcon.vcon_dict["sessions"][self.session_index]
+        if session.start_time:
+            session_dict["start"] = session.start_time.isoformat()
+        if session.duration_seconds:
+            session_dict["duration"] = session.duration_seconds
+
+        self._session_status = session.status
+        if session.start_time:
+            self._session_start = session.start_time
+        elif meeting.start_date:
+            # No scheduled time: date the grants by the meeting's first day.
+            d = meeting.start_date
+            self._session_start = datetime(d.year, d.month, d.day, tzinfo=UTC)
+        else:
+            self._session_start = None
+
         # Add meeting metadata as attachment. body is a JSON *string*: the spec
         # requires a string body even when the content is JSON.
+        self._meeting_metadata = {
+            "ietf_meeting_number": meeting.number,
+            "location": f"{meeting.city}, {meeting.country}" if meeting.city else None,
+            "working_group": session.group_acronym,
+            "session_id": session.session_id,
+            # Omitted when the status is unknown. A session that did not meet
+            # has no start_time, duration_seconds or room (the datatracker
+            # layer leaves them out), matching the Session, which has no start.
+            **({"status": session.status} if session.status else {}),
+            "room": session.room,
+            "start_time": session.start_time.isoformat() if session.start_time else None,
+            "duration_seconds": session.duration_seconds,
+        }
+        self._meeting_metadata_index = len(self.vcon.attachments)
         self.vcon.add_attachment(
             purpose="meeting_metadata",
+            party=self.attachment_party,
+            session=self.session_index,
             encoding="json",
-            body=json_body({
-                "ietf_meeting_number": meeting.number,
-                "location": f"{meeting.city}, {meeting.country}" if meeting.city else None,
-                "working_group": session.group_acronym,
-                "session_id": session.session_id,
-                "room": session.room,
-                "start_time": session.start_time.isoformat() if session.start_time else None,
-                "duration_seconds": session.duration_seconds,
-            }),
+            mediatype="application/json",
+            body="{}",
         )
+        self._write_meeting_metadata()
 
         return self
+
+    def _write_meeting_metadata(self) -> None:
+        """Serialize the meeting_metadata body, with the materials known so far."""
+        if self._meeting_metadata is None or self._meeting_metadata_index is None:
+            return
+        payload = dict(self._meeting_metadata)
+        if self._materials_info:
+            payload["materials"] = self._materials_info
+        attachment = self.vcon.vcon_dict["attachments"][self._meeting_metadata_index]
+        attachment["body"] = json_body(payload)
 
     def add_party(
         self,
         name: str,
         email: str | None = None,
         role: str | None = None,
-        meta: dict[str, Any] | None = None,
     ) -> int:
-        """Add a party to the vCon. Returns the party index."""
+        """Add a party to the vCon. Returns the party index.
+
+        core-05 defines no Party ``meta``, so none is written.
+        """
         # Check if party already exists
         key = email or name
         if key in self._party_map:
@@ -102,16 +179,17 @@ class VConBuilder:
             name=name,
             mailto=email,
             role=role,
-            meta=meta,
         )
         index = len(self.vcon.parties)
         self.vcon.add_party(party)
         self._party_map[key] = index
-        # `role` on a party comes from the role extension, so using it obliges
-        # the vCon to declare it. Without the declaration a reader is entitled
-        # to ignore the field, which would drop who chaired the session.
+        # `role` on a party is defined by the contact-center extension
+        # (draft-ietf-vcon-cc-extension-02 section 3.1.1), registered as "CC",
+        # so using it obliges the vCon to declare it. Without the declaration a
+        # reader is entitled to ignore the field, which would drop who chaired
+        # the session.
         if role:
-            self.vcon.add_extension("role")
+            self.vcon.add_extension("CC")
         return index
 
     def add_persons(self, persons: list[IETFPerson]) -> list[int]:
@@ -122,17 +200,15 @@ class VConBuilder:
                 name=person.name,
                 email=person.email,
                 role=person.role,
-                meta={"affiliation": person.affiliation} if person.affiliation else None,
             )
             indices.append(idx)
         return indices
 
-    def add_attendees_party(self, count: int | None = None) -> int:
+    def add_attendees_party(self) -> int:
         """Add a generic 'attendees' party representing all participants."""
         return self.add_party(
             name="IETF Attendees",
             role="attendee",
-            meta={"count": count} if count else None,
         )
 
     def add_video_dialog(
@@ -141,7 +217,15 @@ class VConBuilder:
         session: IETFSession,
         party_indices: list[int] | None = None,
     ) -> int:
-        """Add video recording as a dialog. Returns dialog index."""
+        """Add a linked video recording as a dialog. Returns dialog index.
+
+        The dialog carries ``url`` and ``mediatype`` only. It has NO
+        ``content_hash``: a YouTube watch page is mutable HTML, so no honest
+        hash exists. This departs from vCon core-05 Section 2.4 (and the
+        Appendix C ``url -> content_hash`` dependency) pending WG issue
+        https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40.
+        No Dialog ``meta`` is written either: core-05 defines none.
+        """
         start_time = session.start_time or datetime.now(UTC)
 
         dialog = Dialog(
@@ -151,17 +235,10 @@ class VConBuilder:
             parties=party_indices or list(range(len(self.vcon.parties))),
             mediatype="video/mp4",
             url=video.url,
-            meta={
-                "source": "youtube",
-                "video_id": video.video_id,
-                "title": video.title,
-                "ietf_meeting": session.meeting_number,
-                "working_group": session.group_acronym,
-            },
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
         return index
 
     def add_video_dialog_from_url(
@@ -171,7 +248,12 @@ class VConBuilder:
         mimetype: str = "video/mp4",
         party_indices: list[int] | None = None,
     ) -> int:
-        """Add video dialog from a URL (YouTube or Meetecho)."""
+        """Add a linked recording (YouTube, Meetecho, ietf.org MP3) from a URL.
+
+        ``url`` and ``mediatype`` only; no ``content_hash`` (none can honestly
+        be computed for these targets), a known departure from core-05
+        Section 2.4 pending WG issue #40. No Dialog ``meta``.
+        """
         start_time = session.start_time or datetime.now(UTC)
 
         dialog = Dialog(
@@ -181,14 +263,10 @@ class VConBuilder:
             parties=party_indices or list(range(len(self.vcon.parties))),
             mediatype=mimetype,
             url=url,
-            meta={
-                "ietf_meeting": session.meeting_number,
-                "working_group": session.group_acronym,
-            },
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
         return index
 
     def add_video_dialog_inline(
@@ -218,7 +296,7 @@ class VConBuilder:
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
         return index
 
     def add_chat_dialog(
@@ -227,7 +305,10 @@ class VConBuilder:
         session: IETFSession,
         as_text: bool = True,
     ) -> int:
-        """Add chat log as a text dialog. Returns dialog index."""
+        """Add chat log as a text dialog. Returns dialog index.
+
+        No Dialog ``meta`` is written: core-05 defines none.
+        """
         if not messages:
             return -1
 
@@ -247,17 +328,10 @@ class VConBuilder:
             mediatype=mimetype,
             body=body if isinstance(body, str) else None,
             encoding="none",
-            meta={
-                "source": "zulip",
-                "stream": messages[0].stream if messages else None,
-                "message_count": len(messages),
-                "ietf_meeting": session.meeting_number,
-                "working_group": session.group_acronym,
-            },
         )
 
         index = len(self.vcon.dialog)
-        self.vcon.add_dialog(dialog)
+        self.vcon.add_dialog(dialog, session=self.session_index)
 
         # If JSON format, set body as dict after creation
         if not as_text:
@@ -283,19 +357,24 @@ class VConBuilder:
         3. otherwise -- a reference in the body. This is the only option for a
            mutable landing page, and the fallback when a fetch fails.
 
-        ``title`` has no registered attachment parameter, so it rides in
-        ``meta``.
+        core-05 defines no attachment ``meta``, so the title and the Datatracker
+        page of an external reference are recorded in the ``materials`` member
+        of the ``meeting_metadata`` attachment instead.
         """
         if inline and content:
             self.vcon.add_attachment(
                 purpose=material.type,
+                party=self.attachment_party,
+                session=self.session_index,
                 body=base64.urlsafe_b64encode(content).decode("ascii"),
                 encoding="base64url",
-                mediatype=material.mimetype,
+                mediatype=material.mimetype or "application/octet-stream",
                 filename=material.filename,
                 content_hash=content_hash_token(content),
             )
-        elif content and not material.landing_page:
+        elif content and not material.landing_page and (
+            external_url := self._external_url(material)
+        ):
             # The reference points at the file, not at the page about it. The
             # Datatracker material URL renders Markdown as HTML and converts
             # PowerPoint to PDF, so a content_hash of the published bytes
@@ -304,26 +383,37 @@ class VConBuilder:
             # is kept alongside.
             self.vcon.add_attachment(
                 purpose=material.type,
-                url=material.file_url or material.url,
+                party=self.attachment_party,
+                session=self.session_index,
+                url=external_url,
                 content_hash=content_hash_token(content),
                 mediatype=material.mimetype,
                 filename=material.filename,
             )
-            # vcon-lib has no meta kwarg, and an external reference has no body
-            # to carry a title, so set it on the serialized attachment.
-            meta = {}
+            # An external reference has no body to carry a title, and core-05
+            # has no attachment meta, so the details go to meeting_metadata.
+            # `url` is always written: the same filename can be published under
+            # two paths (an agenda and minutes both named "ntp.txt"). Every
+            # external reference gets an entry, so the list matches the
+            # referenced attachments one for one.
+            info: dict[str, Any] = {}
+            if material.filename:
+                info["filename"] = material.filename
+            info["url"] = external_url
             if material.title:
-                meta["title"] = material.title
+                info["title"] = material.title
             if material.file_url and material.file_url != material.url:
-                meta["datatracker_url"] = material.url
-            if meta:
-                self._set_attachment_meta(-1, meta)
+                info["datatracker_url"] = material.url
+            self._materials_info.append(info)
+            self._write_meeting_metadata()
         else:
             # body MUST be a string, even when the content is JSON. Emitting a
             # dict here is what the repo's core-02 migration had to clean up
             # across the whole published corpus.
             self.vcon.add_attachment(
                 purpose=material.type,
+                party=self.attachment_party,
+                session=self.session_index,
                 body=json.dumps(
                     {
                         "url": material.url,
@@ -334,16 +424,48 @@ class VConBuilder:
                     ensure_ascii=False,
                 ),
                 encoding="json",
+                mediatype="application/json",
             )
 
         return self
 
-    def _set_attachment_meta(self, index: int, meta: dict[str, Any]) -> None:
-        """Attach `meta` to a serialized attachment and declare the extension."""
-        self.vcon.vcon_dict["attachments"][index].setdefault("meta", {}).update(meta)
-        extensions = self.vcon.vcon_dict.setdefault("extensions", [])
-        if "meta" not in extensions:
-            extensions.append("meta")
+    @staticmethod
+    def _external_url(material: IETFMaterial) -> str | None:
+        """The URL for a hashed external reference, or None if none can be formed.
+
+        ``url``, ``filename``, ``mediatype`` and ``content_hash`` must describe
+        one file: the one whose bytes were read. ``material.filename`` is that
+        file's name, but ``file_url`` is built from the Datatracker's
+        ``uploaded_filename``, which can name a different sibling (the record
+        says ``.pdf`` where the mirror and ietf.org hold only the ``.pptx``). So
+        when the names differ the URL is rebuilt from the name actually read,
+        in the same proceedings directory. A document with no ``file_url`` (an
+        older one) keeps the Datatracker page as its URL, as before. If a
+        differing name cannot be put into a URL, the caller falls back to an
+        unhashed body reference.
+        """
+        url = material.file_url or material.url
+        if not material.file_url or not material.filename:
+            return url
+        parsed = urlparse(url)
+        if unquote(parsed.path.rsplit("/", 1)[-1]) == material.filename:
+            return url
+        if parsed.scheme not in ("http", "https") or not parsed.netloc or "/" not in parsed.path:
+            logger.warning(
+                "No URL serves %s as read for %s (%s); keeping an unhashed body reference",
+                material.filename, material.title or material.type, url,
+            )
+            return None
+        rebuilt = parsed._replace(
+            path=parsed.path.rsplit("/", 1)[0] + "/" + quote(material.filename),
+            query="", fragment="",
+        ).geturl()
+        logger.info(
+            "%s: the file read is %s, not %s; the URL names it",
+            material.title or material.type, material.filename,
+            unquote(parsed.path.rsplit("/", 1)[-1]),
+        )
+        return rebuilt
 
     def add_materials(
         self,
@@ -368,6 +490,12 @@ class VConBuilder:
                     material.filename = filename
             self.add_material_attachment(material, content=content, inline=inline)
         return self
+
+    def _analysis_scope(self, dialog_index: int | None) -> dict[str, Any]:
+        """What an analysis describes: a Dialog if there is one, else the Session."""
+        if dialog_index is not None and 0 <= dialog_index < len(self.vcon.dialog):
+            return {"dialog": dialog_index}
+        return {"sessions": self.session_index}
 
     def add_transcript(
         self,
@@ -418,11 +546,12 @@ class VConBuilder:
         }
         self.vcon.add_analysis(
             type="wtf_transcription",
-            dialog=dialog_index,
+            **self._analysis_scope(dialog_index),
             vendor=transcript.provider or "unknown",
             product=transcript.model or None,
             body=json_body(body),
             encoding="json",
+            mediatype="application/json",
         )
         self.vcon.add_extension("wtf_transcription")
         return self
@@ -437,10 +566,11 @@ class VConBuilder:
         """Add generic analysis data."""
         self.vcon.add_analysis(
             type=analysis_type,
-            dialog=dialog_index if dialog_index is not None else 0,
+            **self._analysis_scope(dialog_index),
             vendor=vendor or "unknown",
             body=body,
             encoding="json" if isinstance(body, dict) else "none",
+            **({"mediatype": "application/json"} if isinstance(body, dict) else {}),
         )
         return self
 
@@ -452,7 +582,10 @@ class VConBuilder:
         """Add ingress (source) information attachment."""
         self.vcon.add_attachment(
             purpose="ingress_info",
+            party=self.attachment_party,
+            session=self.session_index,
             encoding="json",
+            mediatype="application/json",
             body=json_body({
                 "source": source,
                 "converter_version": __version__,
@@ -473,14 +606,21 @@ class VConBuilder:
         controller: str | None = None,
         expiration: datetime | None = None,
         notes: str | None = None,
+        granted_at: datetime | None = None,
     ) -> "VConBuilder":
-        """Add a lawful basis attachment using vcon-lib's lawful basis extension."""
+        """Add a lawful basis attachment using vcon-lib's lawful basis extension.
+
+        ``granted_at`` dates every grant; when omitted it is the session start
+        known from set_meeting_metadata(), and the conversion time only if no
+        session date is known at all.
+        """
+        granted_at = granted_at or self._session_start or datetime.now(UTC)
         grants = []
         for grant in (purpose_grants or []):
             grants.append({
                 "purpose": grant.get("purpose", ""),
                 "granted": grant.get("status", "granted") == "granted",
-                "granted_at": datetime.now(UTC).isoformat(),
+                "granted_at": granted_at.isoformat(),
             })
 
         exp = expiration.isoformat() + "Z" if expiration else "2099-12-31T23:59:59Z"
@@ -502,11 +642,14 @@ class VConBuilder:
             purpose_grants=grants,
             terms_of_service=terms_of_service,
             metadata=meta if meta else None,
+            party_index=self.attachment_party,
+            session_index=self.session_index,
         )
         # vcon-lib's extension helper leaves the body as an object. The spec
         # wants a string, so normalize here rather than emit a body no
         # conforming reader should accept.
         attachment = self.vcon.vcon_dict["attachments"][-1]
+        attachment.setdefault("mediatype", "application/json")
         body = attachment.get("body")
         if isinstance(body, dict):
             # A basis with no proof_mechanisms[] is hollow: it asserts a basis
@@ -525,8 +668,35 @@ class VConBuilder:
         The IETF Note Well establishes the legal basis for recording and
         processing IETF meeting sessions.
         """
-        return self.add_lawful_basis(
+        proof_mechanisms = [
+            {
+                "mechanism_type": "external_system",
+                "description": (
+                    "IETF Note Well, the IETF's published policy for meeting "
+                    "participation, at https://www.ietf.org/about/note-well/. "
+                    "Participation in an IETF session constitutes agreement to it."
+                ),
+            },
+        ]
+        # The second mechanism asserts that the session was held and that its
+        # bluesheets are referenced. That is false for a session whose status
+        # says it did not meet (cancelled, not meeting, ...), so it is left
+        # out there; and it is true only if this vCon carries a bluesheets
+        # attachment, which build() checks once every attachment is known. An
+        # unknown status keeps it, as before.
+        if self._session_status in (None, MET_STATUS):
+            proof_mechanisms.append({
+                "mechanism_type": "external_system",
+                "description": (
+                    "IETF Datatracker session record, including the bluesheets "
+                    "attendance document referenced by this vCon, evidencing that "
+                    "the session was held and published under that policy."
+                ),
+            })
+        self._lawful_proofs = [dict(p) for p in proof_mechanisms]
+        result = self.add_lawful_basis(
             lawful_basis="legitimate_interests",
+            granted_at=session_start,
             purpose_grants=[
                 {"purpose": "recording", "status": "granted"},
                 {"purpose": "transcription", "status": "granted"},
@@ -539,24 +709,7 @@ class VConBuilder:
             # bluesheets attachment carried by this vCon, is the record of the
             # session having been held under it. Both are checkable by a third
             # party, which is the point of the field.
-            proof_mechanisms=[
-                {
-                    "mechanism_type": "external_system",
-                    "description": (
-                        "IETF Note Well, the IETF's published policy for meeting "
-                        "participation, at https://www.ietf.org/about/note-well/. "
-                        "Participation in an IETF session constitutes agreement to it."
-                    ),
-                },
-                {
-                    "mechanism_type": "external_system",
-                    "description": (
-                        "IETF Datatracker session record, including the bluesheets "
-                        "attendance document referenced by this vCon, evidencing that "
-                        "the session was held and published under that policy."
-                    ),
-                },
-            ],
+            proof_mechanisms=proof_mechanisms,
             terms_of_service="https://www.ietf.org/about/note-well/",
             terms_of_service_name="IETF Note Well",
             jurisdiction="IETF",
@@ -567,28 +720,54 @@ class VConBuilder:
                 "See also BCP 78 (RFC 5378) and BCP 79 (RFC 8179) for IPR policies."
             ),
         )
+        self._lawful_basis_index = len(self.vcon.vcon_dict["attachments"]) - 1
+        return result
+
+    def _settle_lawful_basis(self) -> None:
+        """Keep the second proof entry only if this vCon carries a bluesheets attachment.
+
+        The entry refers to "the bluesheets attendance document referenced by
+        this vCon". Materials are added after the lawful basis, so whether the
+        reference is true is only known once the attachments are final. The
+        attachment keeps its position and its body stays a JSON string; the
+        wording of the entries is not changed.
+        """
+        if self._lawful_basis_index is None or not self._lawful_proofs:
+            return
+        attachment = self.vcon.vcon_dict["attachments"][self._lawful_basis_index]
+        body = json.loads(attachment["body"])
+        has_bluesheets = any(
+            isinstance(a, dict) and a.get("purpose") == "bluesheets"
+            for a in self.vcon.vcon_dict["attachments"]
+        )
+        body["proof_mechanisms"] = (
+            self._lawful_proofs if has_bluesheets else self._lawful_proofs[:1]
+        )
+        attachment["body"] = json_body(body)
 
     def build(self) -> Vcon:
         """Build and return the final vCon."""
         self.vcon.vcon_dict["updated_at"] = datetime.now(UTC).isoformat()
-        self._complete_attachments()
+        self._finish_session()
+        self._settle_lawful_basis()
         return self.vcon
 
-    def _complete_attachments(self) -> None:
-        """Fill in the attachment fields core-02 requires.
+    def _finish_session(self) -> None:
+        """Fill in the Session's receivers and originator.
 
-        `party`, `dialog` and `start` are required on every attachment. These
-        are vCon-level attachments -- they describe the session, not one
-        speaker's contribution -- so the convention is party 0, dialog 0 and
-        the vCon's own created_at. Applied at build time so attachments added
-        by vcon-lib extensions are covered too.
+        Parties are added chairs first, then the attendees party, so the first
+        party is the organizer when one is known and is the implied originator
+        (core-05 4.2.4); ``originator`` is therefore never written. With no
+        chair known the attendees party is first and, by the same rule, is the
+        implied originator: the Datatracker names no one else. Receivers are
+        every party in the vCon.
         """
-        created_at = self.vcon.vcon_dict.get("created_at")
-        for attachment in self.vcon.vcon_dict.get("attachments") or []:
-            attachment.setdefault("party", 0)
-            attachment.setdefault("dialog", 0)
-            if created_at:
-                attachment.setdefault("start", created_at)
+        session = self.vcon.vcon_dict["sessions"][self.session_index]
+        count = len(self.vcon.parties)
+        if count:
+            session["parties"] = list(range(count))
+        else:
+            session.pop("parties", None)
 
     def to_json(self, indent: int = 2) -> str:
         """Build and serialize to JSON."""

@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from .httpclient import get_with_retries
 
 from .models import ChatMessage
 
@@ -71,12 +71,9 @@ class ZulipClient:
     def __exit__(self, *args):
         self.close()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def _get(self, endpoint: str, params: dict | None = None) -> dict[str, Any]:
-        """Make an authenticated GET request."""
-        response = self.client.get(f"/api/v1/{endpoint}", params=params)
-        response.raise_for_status()
-        return response.json()
+        """Make an authenticated GET request (throttled and retried like the rest)."""
+        return get_with_retries(self.client, f"/api/v1/{endpoint}", params).json()
 
     def get_streams(self) -> list[dict[str, Any]]:
         """Get list of all streams (channels)."""

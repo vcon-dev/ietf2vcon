@@ -42,6 +42,9 @@ class IETFSession(BaseModel):
     end_time: datetime | None = None
     duration_seconds: int | None = None
     room: str | None = None
+    # The session's current scheduling status slug ("sched", "canceled",
+    # "notmeet", ...), or None when it could not be determined.
+    status: str | None = None
     agenda_url: str | None = None
     minutes_url: str | None = None
     video_url: str | None = None

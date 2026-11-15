@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Validate randomly sampled vCon files for errors.
 
+Validates against the vCon core-05 Appendix C JSON Schema (vendored at
+scripts/schemas/appendix-c-json-schema.json), then applies IETF-specific
+checks: lawful basis present and scoped, Session wiring, ingress_info.
+
 Usage:
     python scripts/validate_vcons.py output/
     python scripts/validate_vcons.py output/ --sample 10
@@ -16,26 +20,61 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
+import jsonschema
 from rich.console import Console
 from rich.table import Table
 
 console = Console()
 
+WG_ISSUE_URL = (
+    "https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40"
+)
+KNOWN_DEVIATION_LABEL = (
+    "recording Dialog url (YouTube / IETF recording) without content_hash"
+)
+_YOUTUBE_HOSTS = {"youtube.com", "youtu.be"}
+_IETF_RECORDING_PATH = re.compile(r"/audio/|recording|\.(mp3|m4a|mp4|webm)$", re.I)
+
+
+def is_recording_link(url: Any) -> bool:
+    """True for a YouTube or IETF meeting-recording URL (no stable bytes to hash)."""
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    def under(domain: str) -> bool:
+        return host == domain or host.endswith("." + domain)
+
+    if any(under(d) for d in _YOUTUBE_HOSTS):
+        return True
+    if under("meetecho.com"):
+        return True
+    return under("ietf.org") and bool(_IETF_RECORDING_PATH.search(parsed.path))
+
+
+SCHEMA_PATH = Path(__file__).parent / "schemas" / "appendix-c-json-schema.json"
+
 
 class VConValidator:
     """Validates vCon files for structural and content errors."""
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, schema_path: Path = SCHEMA_PATH):
         self.verbose = verbose
+        self.schema = json.loads(Path(schema_path).read_text())
+        jsonschema.Draft7Validator.check_schema(self.schema)
+        self._schema_validator = jsonschema.Draft7Validator(self.schema)
         self.errors: list[str] = []
         self.warnings: list[str] = []
+        self.known_deviations: list[str] = []
 
     def reset(self):
-        """Reset errors and warnings for a new validation."""
+        """Reset errors, warnings and known deviations for a new validation."""
         self.errors = []
         self.warnings = []
+        self.known_deviations = []
 
     def error(self, msg: str):
         """Record an error."""
@@ -63,7 +102,10 @@ class VConValidator:
             return False, self.errors, self.warnings
 
         # Validate structure
+        self._validate_schema(data)
+        self._validate_sessions(data)
         self._validate_root(data)
+        self._validate_extensions(data)
         self._validate_parties(data.get("parties", []))
         self._validate_dialogs(data.get("dialog", []))
         self._validate_attachments(data.get("attachments", []))
@@ -71,6 +113,124 @@ class VConValidator:
 
         success = len(self.errors) == 0
         return success, self.errors.copy(), self.warnings.copy()
+
+    def _validate_schema(self, data: Any):
+        """Validate against the core-05 Appendix C JSON Schema."""
+        for err in sorted(
+            self._schema_validator.iter_errors(data), key=lambda e: list(e.absolute_path)
+        ):
+            where = "/".join(str(p) for p in err.absolute_path) or "(root)"
+            if self._is_known_deviation(data, err):
+                self.known_deviations.append(f"{where}: {KNOWN_DEVIATION_LABEL}")
+                continue
+            self.error(f"Schema: {where}: {err.message[:200]}")
+
+    @staticmethod
+    def _is_known_deviation(data: Any, err: "jsonschema.ValidationError") -> bool:
+        """The one tolerated error: url without content_hash on a recording link.
+
+        Only a ``dependencies`` failure for ``content_hash`` on a Dialog of
+        type recording whose url is a YouTube or IETF recording URL. An
+        attachment, a non-recording dialog or any other URL stays a failure.
+        See WG issue #40.
+        """
+        path = list(err.absolute_path)
+        if err.validator != "dependencies" or len(path) != 2 or path[0] != "dialog":
+            return False
+        if "'content_hash' is a dependency of 'url'" not in err.message:
+            return False
+        try:
+            dialog = data["dialog"][path[1]]
+        except (KeyError, IndexError, TypeError):
+            return False
+        return (
+            isinstance(dialog, dict)
+            and dialog.get("type") == "recording"
+            and "content_hash" not in dialog
+            and is_recording_link(dialog.get("url"))
+        )
+
+    def _validate_sessions(self, data: dict[str, Any]):
+        """Core-05 wiring the schema cannot express: index bounds and scoping."""
+        if not isinstance(data, dict):
+            return
+        sessions = data.get("sessions") or []
+        dialogs = data.get("dialog") or []
+        parties = data.get("parties") or []
+        if (dialogs or data.get("events")) and not sessions:
+            self.error("dialog or events present but no sessions[]")
+        listed: set[int] = set()
+        for i, sess in enumerate(sessions):
+            for d in sess.get("dialog") or []:
+                if not isinstance(d, int) or not 0 <= d < len(dialogs):
+                    self.error(f"Session {i}: dialog index {d} out of range")
+                else:
+                    listed.add(d)
+            for p in sess.get("parties") or []:
+                if not isinstance(p, int) or not 0 <= p < len(parties):
+                    self.error(f"Session {i}: party index {p} out of range")
+        for d, dialog in enumerate(dialogs):
+            if dialog and d not in listed:
+                self.warn(f"Dialog {d} is not listed by any Session")
+            if isinstance(dialog, dict):
+                for p in self._flatten(dialog.get("parties")):
+                    if not (isinstance(p, int) and 0 <= p < len(parties)):
+                        self.error(f"Dialog {d}: party index {p} out of range")
+        for i, att in enumerate(data.get("attachments") or []):
+            if not isinstance(att, dict):
+                continue
+            if "party" not in att:
+                self.error(f"Attachment {i}: missing party")
+            elif not (isinstance(att["party"], int) and 0 <= att["party"] < len(parties)):
+                self.error(f"Attachment {i}: party index {att['party']} out of range")
+            if "dialog" not in att and "session" not in att:
+                self.error(f"Attachment {i}: needs dialog or session")
+            if "dialog" in att and not (
+                isinstance(att["dialog"], int) and 0 <= att["dialog"] < len(dialogs)
+            ):
+                self.error(f"Attachment {i}: dialog index {att['dialog']} out of range")
+            scope = att.get("session")
+            for ref in ([scope] if isinstance(scope, int) else scope or []):
+                if not (isinstance(ref, int) and 0 <= ref < len(sessions)):
+                    self.error(f"Attachment {i}: session index {ref} out of range")
+            if att.get("purpose") == "lawful_basis" and "session" not in att:
+                self.error(f"Attachment {i} (lawful_basis): not scoped to a session")
+        for i, an in enumerate(data.get("analysis") or []):
+            if not isinstance(an, dict):
+                continue
+            for key, limit in (("dialog", len(dialogs)), ("sessions", len(sessions))):
+                ref = an.get(key)
+                for r in ([ref] if isinstance(ref, int) else ref or []):
+                    if not (isinstance(r, int) and 0 <= r < limit):
+                        self.error(f"Analysis {i}: {key} index {r} out of range")
+
+    @staticmethod
+    def _flatten(value: Any) -> list[Any]:
+        """Party references are an int, a list, or a list that holds lists."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return [value]
+        out: list[Any] = []
+        for item in value:
+            out.extend(VConValidator._flatten(item) if isinstance(item, list) else [item])
+        return out
+
+    def _validate_extensions(self, data: dict[str, Any]):
+        """Names in `extensions` must be registered extension names (core-05 4.1.3)."""
+        if not isinstance(data, dict):
+            return
+        extensions = data.get("extensions") or []
+        if not isinstance(extensions, list):
+            return
+        for name in ("role", "meta"):
+            if name in extensions:
+                self.error(f"extensions: {name!r} is not an extension name")
+        parties = data.get("parties") or []
+        if "CC" not in extensions and any(
+            isinstance(p, dict) and "role" in p for p in parties
+        ):
+            self.error('A party has role but "CC" is not listed in extensions')
 
     def _validate_root(self, data: dict[str, Any]):
         """Validate root-level vCon structure."""
@@ -82,8 +242,8 @@ class VConValidator:
 
         # vCon version
         if "vcon" in data:
-            if data["vcon"] != "0.0.1":
-                self.warn(f"Unexpected vCon version: {data['vcon']}")
+            if data["vcon"] != "0.5.0":
+                self.warn(f"Expected vCon 0.5.0, got: {data['vcon']}")
 
         # UUID format
         if "uuid" in data:
@@ -115,6 +275,9 @@ class VConValidator:
                 self.error(f"Party {i}: not a dict")
                 continue
 
+            if "meta" in party:
+                self.error(f"Party {i}: meta is not defined by core-05")
+
             # Should have at least name or tel or mailto
             has_identity = any(
                 party.get(f) for f in ["name", "tel", "mailto", "uri"]
@@ -145,17 +308,20 @@ class VConValidator:
                 self.error(f"Dialog {i}: not a dict")
                 continue
 
+            if "meta" in dialog:
+                self.error(f"Dialog {i}: meta is not defined by core-05")
+
             # Must have type
             if "type" not in dialog:
                 self.error(f"Dialog {i}: missing type")
             else:
-                valid_types = ["recording", "video", "audio", "text", "transfer"]
+                valid_types = ["recording", "text", "incomplete"]
                 if dialog["type"] not in valid_types:
                     self.warn(f"Dialog {i}: unusual type: {dialog['type']}")
 
             # Must have either url or body
             has_content = dialog.get("url") or dialog.get("body")
-            if not has_content:
+            if not has_content and dialog.get("type") != "incomplete":
                 self.error(f"Dialog {i}: missing both url and body")
 
             # Validate URL if present
@@ -188,14 +354,17 @@ class VConValidator:
                 self.error(f"Attachment {i}: not a dict")
                 continue
 
-            # Must have type
-            if "type" not in att:
-                self.error(f"Attachment {i}: missing type")
+            if "meta" in att:
+                self.error(f"Attachment {i}: meta is not defined by core-05")
+
+            # Must have purpose (legacy "type" is not accepted)
+            if "purpose" not in att:
+                self.error(f"Attachment {i}: missing purpose")
             else:
-                if att["type"] == "lawful_basis":
+                if att["purpose"] == "lawful_basis":
                     has_lawful_basis = True
                     self._validate_lawful_basis(att, i)
-                elif att["type"] == "ingress_info":
+                elif att["purpose"] == "ingress_info":
                     has_ingress_info = True
 
             # Must have either url or body
@@ -206,6 +375,7 @@ class VConValidator:
             # Validate URL if present
             if "url" in att and att["url"]:
                 self._validate_url(att["url"], f"Attachment {i}")
+                self._validate_url_names_file(att, i)
 
         # IETF vCons should have lawful basis (Note Well)
         if not has_lawful_basis:
@@ -214,6 +384,26 @@ class VConValidator:
         if not has_ingress_info:
             self.warn("No ingress_info attachment")
 
+    _FILE_EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+
+    def _validate_url_names_file(self, att: dict, index: int):
+        """url, filename and content_hash must describe one file.
+
+        When an attachment has both a url and a filename and the url's last path
+        segment (query and fragment ignored, percent-escapes undone) is a file
+        name, it must be the filename. A segment with no extension is a
+        Datatracker document name (a materials page), not a file name, and is
+        not compared.
+        """
+        url, filename = att.get("url"), att.get("filename")
+        if not isinstance(url, str) or not isinstance(filename, str):
+            return
+        segment = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+        if self._FILE_EXTENSION.search(segment) and segment != filename:
+            self.error(
+                f"Attachment {index}: url names {segment!r} but filename is {filename!r}"
+            )
+
     def _validate_lawful_basis(self, att: dict, index: int):
         """Validate lawful_basis attachment."""
         body = att.get("body")
@@ -221,6 +411,12 @@ class VConValidator:
             self.error(f"Attachment {index} (lawful_basis): missing body")
             return
 
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except json.JSONDecodeError:
+                self.error(f"Attachment {index} (lawful_basis): body is not JSON")
+                return
         if not isinstance(body, dict):
             self.error(f"Attachment {index} (lawful_basis): body is not a dict")
             return
@@ -256,22 +452,29 @@ class VConValidator:
                 if item["type"] == "wtf_transcription":
                     self._validate_wtf_transcription(item, i)
 
-            # Must have body
+            # core-05 4.7.11: body and encoding, or url and content_hash
             if "body" not in item:
-                self.error(f"Analysis {i}: missing body")
+                if "url" not in item:
+                    self.error(f"Analysis {i}: missing both body and url")
+                elif "content_hash" not in item:
+                    self.error(f"Analysis {i}: url without content_hash")
 
     def _validate_wtf_transcription(self, item: dict, index: int):
         """Validate WTF transcription format."""
         # Should have spec field
-        if "spec" not in item:
-            self.warn(f"Analysis {index} (wtf): missing spec field")
-        elif "draft-howe-wtf" not in str(item.get("spec", "")):
-            self.warn(f"Analysis {index} (wtf): unexpected spec: {item['spec']}")
+        if "vendor" not in item:
+            self.error(f"Analysis {index} (wtf): missing vendor")
 
         body = item.get("body")
         if not body:
             return
 
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except json.JSONDecodeError:
+                self.error(f"Analysis {index} (wtf): body is not JSON")
+                return
         if not isinstance(body, dict):
             self.error(f"Analysis {index} (wtf): body is not a dict")
             return
@@ -385,7 +588,9 @@ def main():
 
     for path in sorted(selected):
         success, errors, warnings = validator.validate_file(path)
-        results.append((path.name, success, errors, warnings))
+        results.append(
+            (path.name, success, errors, warnings, validator.known_deviations.copy())
+        )
 
     # Display results
     table = Table(title="Validation Results")
@@ -397,8 +602,10 @@ def main():
     total_errors = 0
     total_warnings = 0
     failed_files = 0
+    total_known = sum(len(k) for *_, k in results)
+    files_known = sum(1 for *_, k in results if k)
 
-    for name, success, errors, warnings in results:
+    for name, success, errors, warnings, _known in results:
         status = "[green]✓[/green]" if success else "[red]✗[/red]"
         error_count = str(len(errors)) if errors else "-"
         warning_count = str(len(warnings)) if warnings else "-"
@@ -419,11 +626,16 @@ def main():
     console.print(f"  Failed: [red]{failed_files}[/red]")
     console.print(f"  Total errors: [red]{total_errors}[/red]")
     console.print(f"  Total warnings: [yellow]{total_warnings}[/yellow]")
+    console.print(
+        f"  Known deviations (not failures): [yellow]{total_known}[/yellow]"
+        f" in {files_known} file(s); {KNOWN_DEVIATION_LABEL}."
+        f" See {WG_ISSUE_URL}"
+    )
 
     # Show detailed errors if verbose or if there are failures
     if args.verbose or failed_files > 0:
         console.print("\n[bold]Details:[/bold]")
-        for name, success, errors, warnings in results:
+        for name, success, errors, warnings, _known in results:
             if errors or (args.verbose and warnings):
                 console.print(f"\n[cyan]{name}[/cyan]")
                 for e in errors:
