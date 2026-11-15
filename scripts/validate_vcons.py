@@ -20,7 +20,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import jsonschema
 from rich.console import Console
@@ -105,6 +105,7 @@ class VConValidator:
         self._validate_schema(data)
         self._validate_sessions(data)
         self._validate_root(data)
+        self._validate_extensions(data)
         self._validate_parties(data.get("parties", []))
         self._validate_dialogs(data.get("dialog", []))
         self._validate_attachments(data.get("attachments", []))
@@ -171,6 +172,10 @@ class VConValidator:
         for d, dialog in enumerate(dialogs):
             if dialog and d not in listed:
                 self.warn(f"Dialog {d} is not listed by any Session")
+            if isinstance(dialog, dict):
+                for p in self._flatten(dialog.get("parties")):
+                    if not (isinstance(p, int) and 0 <= p < len(parties)):
+                        self.error(f"Dialog {d}: party index {p} out of range")
         for i, att in enumerate(data.get("attachments") or []):
             if not isinstance(att, dict):
                 continue
@@ -180,6 +185,10 @@ class VConValidator:
                 self.error(f"Attachment {i}: party index {att['party']} out of range")
             if "dialog" not in att and "session" not in att:
                 self.error(f"Attachment {i}: needs dialog or session")
+            if "dialog" in att and not (
+                isinstance(att["dialog"], int) and 0 <= att["dialog"] < len(dialogs)
+            ):
+                self.error(f"Attachment {i}: dialog index {att['dialog']} out of range")
             scope = att.get("session")
             for ref in ([scope] if isinstance(scope, int) else scope or []):
                 if not (isinstance(ref, int) and 0 <= ref < len(sessions)):
@@ -187,10 +196,41 @@ class VConValidator:
             if att.get("purpose") == "lawful_basis" and "session" not in att:
                 self.error(f"Attachment {i} (lawful_basis): not scoped to a session")
         for i, an in enumerate(data.get("analysis") or []):
-            ref = an.get("dialog") if isinstance(an, dict) else None
-            for r in ([ref] if isinstance(ref, int) else ref or []):
-                if not (isinstance(r, int) and 0 <= r < len(dialogs)):
-                    self.error(f"Analysis {i}: dialog index {r} out of range")
+            if not isinstance(an, dict):
+                continue
+            for key, limit in (("dialog", len(dialogs)), ("sessions", len(sessions))):
+                ref = an.get(key)
+                for r in ([ref] if isinstance(ref, int) else ref or []):
+                    if not (isinstance(r, int) and 0 <= r < limit):
+                        self.error(f"Analysis {i}: {key} index {r} out of range")
+
+    @staticmethod
+    def _flatten(value: Any) -> list[Any]:
+        """Party references are an int, a list, or a list that holds lists."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return [value]
+        out: list[Any] = []
+        for item in value:
+            out.extend(VConValidator._flatten(item) if isinstance(item, list) else [item])
+        return out
+
+    def _validate_extensions(self, data: dict[str, Any]):
+        """Names in `extensions` must be registered extension names (core-05 4.1.3)."""
+        if not isinstance(data, dict):
+            return
+        extensions = data.get("extensions") or []
+        if not isinstance(extensions, list):
+            return
+        for name in ("role", "meta"):
+            if name in extensions:
+                self.error(f"extensions: {name!r} is not an extension name")
+        parties = data.get("parties") or []
+        if "CC" not in extensions and any(
+            isinstance(p, dict) and "role" in p for p in parties
+        ):
+            self.error('A party has role but "CC" is not listed in extensions')
 
     def _validate_root(self, data: dict[str, Any]):
         """Validate root-level vCon structure."""
@@ -235,6 +275,9 @@ class VConValidator:
                 self.error(f"Party {i}: not a dict")
                 continue
 
+            if "meta" in party:
+                self.error(f"Party {i}: meta is not defined by core-05")
+
             # Should have at least name or tel or mailto
             has_identity = any(
                 party.get(f) for f in ["name", "tel", "mailto", "uri"]
@@ -264,6 +307,9 @@ class VConValidator:
             if not isinstance(dialog, dict):
                 self.error(f"Dialog {i}: not a dict")
                 continue
+
+            if "meta" in dialog:
+                self.error(f"Dialog {i}: meta is not defined by core-05")
 
             # Must have type
             if "type" not in dialog:
@@ -308,6 +354,9 @@ class VConValidator:
                 self.error(f"Attachment {i}: not a dict")
                 continue
 
+            if "meta" in att:
+                self.error(f"Attachment {i}: meta is not defined by core-05")
+
             # Must have purpose (legacy "type" is not accepted)
             if "purpose" not in att:
                 self.error(f"Attachment {i}: missing purpose")
@@ -326,6 +375,7 @@ class VConValidator:
             # Validate URL if present
             if "url" in att and att["url"]:
                 self._validate_url(att["url"], f"Attachment {i}")
+                self._validate_url_names_file(att, i)
 
         # IETF vCons should have lawful basis (Note Well)
         if not has_lawful_basis:
@@ -333,6 +383,26 @@ class VConValidator:
 
         if not has_ingress_info:
             self.warn("No ingress_info attachment")
+
+    _FILE_EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+
+    def _validate_url_names_file(self, att: dict, index: int):
+        """url, filename and content_hash must describe one file.
+
+        When an attachment has both a url and a filename and the url's last path
+        segment (query and fragment ignored, percent-escapes undone) is a file
+        name, it must be the filename. A segment with no extension is a
+        Datatracker document name (a materials page), not a file name, and is
+        not compared.
+        """
+        url, filename = att.get("url"), att.get("filename")
+        if not isinstance(url, str) or not isinstance(filename, str):
+            return
+        segment = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+        if self._FILE_EXTENSION.search(segment) and segment != filename:
+            self.error(
+                f"Attachment {index}: url names {segment!r} but filename is {filename!r}"
+            )
 
     def _validate_lawful_basis(self, att: dict, index: int):
         """Validate lawful_basis attachment."""
@@ -382,9 +452,12 @@ class VConValidator:
                 if item["type"] == "wtf_transcription":
                     self._validate_wtf_transcription(item, i)
 
-            # Must have body
+            # core-05 4.7.11: body and encoding, or url and content_hash
             if "body" not in item:
-                self.error(f"Analysis {i}: missing body")
+                if "url" not in item:
+                    self.error(f"Analysis {i}: missing both body and url")
+                elif "content_hash" not in item:
+                    self.error(f"Analysis {i}: url without content_hash")
 
     def _validate_wtf_transcription(self, item: dict, index: int):
         """Validate WTF transcription format."""
