@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ietf2vcon"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Convert IETF meeting sessions to vCon format"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,7 +32,6 @@ dependencies = [
     "yt-dlp>=2024.0.0",
     "click>=8.0",
     "rich>=13.0",
-    "tenacity>=8.0",
 ]
 
 [project.optional-dependencies]
@@ -51,6 +50,9 @@ all = [
 
 [project.scripts]
 ietf2vcon = "ietf2vcon.cli:main"
+
+[tool.hatch.version]
+path = "src/ietf2vcon/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ietf2vcon"]
