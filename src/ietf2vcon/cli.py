@@ -5,18 +5,23 @@ Convert IETF meeting sessions to vCon format.
 
 import logging
 import sys
+import threading
 from pathlib import Path
 
 import click
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from .converter import ConversionOptions, IETFSessionConverter
+from . import __version__
+from .converter import ConversionOptions, IETFSessionConverter, remove_stale_partials
+from .errors import SessionReadError
 from .rsync_mirror import sync_proceedings
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def setup_logging(verbose: bool):
@@ -29,8 +34,60 @@ def setup_logging(verbose: bool):
     )
 
 
+def _apply_rate(max_rps: float | None) -> None:
+    """Set the shared request throttle from --max-rps (else the environment/default stays)."""
+    from .httpclient import THROTTLE
+
+    if max_rps is not None:
+        THROTTLE.set_rate(max_rps)
+
+
+def check_mirror(rsync_mirror: Path | None, meeting) -> str | None:
+    """Why a requested rsync mirror is unusable, or None.
+
+    Asking for a mirror that is not there must not quietly fetch every
+    material over HTTP. Interims are not in the mirror, so only a numbered
+    meeting needs its proceedings directory.
+    """
+    if rsync_mirror is None:
+        return None
+    if not rsync_mirror.is_dir():
+        return f"The rsync mirror {rsync_mirror} does not exist or is not a directory"
+    if str(meeting).isdigit():
+        proceedings = rsync_mirror / "proceedings" / str(meeting)
+        if not proceedings.is_dir():
+            return (
+                f"The rsync mirror has no proceedings for IETF {meeting}: "
+                f"{proceedings} is not a directory"
+            )
+    return None
+
+
+def published_files(output_dir: Path, meeting) -> dict[str, list[str]]:
+    """Group acronym -> session ids of the published files for a meeting in ``output_dir``."""
+    import re
+
+    slug = IETFSessionConverter._meeting_slug(meeting)
+    pattern = re.compile(rf"^{re.escape(slug)}_([^_]+)_(\d+)\.vcon\.json$")
+    found: dict[str, list[str]] = {}
+    if output_dir.is_dir():
+        for path in output_dir.iterdir():
+            if m := pattern.match(path.name):
+                found.setdefault(m.group(1), []).append(m.group(2))
+    return {group: sorted(ids, key=int) for group, ids in found.items()}
+
+
+MAX_RPS_OPTION = click.option(
+    "--max-rps",
+    type=float,
+    default=None,
+    help="Most requests per second to the Datatracker and ietf.org, shared by all "
+         "of them (default 8; also IETF2VCON_MAX_RPS; 0 turns the throttle off)",
+)
+
+
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version=__version__, prog_name="ietf2vcon")
 def main():
     """Convert IETF meeting sessions to vCon format.
 
@@ -220,6 +277,7 @@ def _meeting_number(ctx, param, value):
     is_flag=True,
     help="Enable verbose output",
 )
+@MAX_RPS_OPTION
 def convert(
     meeting: int,
     group: str,
@@ -246,6 +304,7 @@ def convert(
     zulip_api_key: str | None,
     rsync_mirror: Path | None,
     verbose: bool,
+    max_rps: float | None,
 ):
     """Convert an IETF session to vCon format.
 
@@ -254,6 +313,12 @@ def convert(
     Use --export-srt or --export-webvtt to generate subtitle files.
     """
     setup_logging(verbose)
+    _apply_rate(max_rps)
+
+    problem = check_mirror(rsync_mirror, meeting)
+    if problem:
+        console.print(f"[red]Error:[/red] {problem}", markup=True)
+        sys.exit(1)
 
     console.print(Panel(
         f"Converting IETF {meeting} - {group.upper()} session {session}",
@@ -288,17 +353,21 @@ def convert(
     converter = IETFSessionConverter(options)
 
     try:
+        converter.remove_stale_partials()
         with console.status("Converting session..."):
             result = converter.convert_session(meeting, group, session)
+
+        # A session that could not be converted completely saves nothing.
+        if result.errors:
+            for error in result.errors:
+                console.print(f"[red]Error:[/red] {escape(error)}")
+            sys.exit(1)
 
         # Save output
         output_path = converter.save_vcon(result, output)
 
         # Display results
         _display_results(result, output_path)
-
-        if result.errors:
-            sys.exit(1)
 
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -330,10 +399,14 @@ def list_sessions(meeting: int, group: str | None):
 
     client = DataTrackerClient()
     try:
-        if group:
-            sessions = client.get_group_sessions(meeting, group)
-        else:
-            sessions = client.get_meeting_sessions(meeting)
+        try:
+            if group:
+                sessions = client.get_group_sessions(meeting, group)
+            else:
+                sessions = client.get_meeting_sessions(meeting)
+        except SessionReadError as e:
+            console.print(f"[red]Error:[/red] {escape(str(e))}")
+            sys.exit(1)
 
         if not sessions:
             console.print("[yellow]No sessions found[/yellow]")
@@ -481,10 +554,18 @@ def list_materials(meeting: int, group: str):
          "Use 'ietf2vcon sync' to populate it.",
 )
 @click.option(
+    "--existing-only",
+    is_flag=True,
+    help="Only regenerate sessions that already have a published file in the "
+         "output directory; never create a new file. Groups the Datatracker lists "
+         "but that have no file are skipped and listed in the summary.",
+)
+@click.option(
     "-v", "--verbose",
     is_flag=True,
     help="Enable verbose output",
 )
+@MAX_RPS_OPTION
 def convert_all(
     meeting: int,
     output_dir: Path,
@@ -497,7 +578,9 @@ def convert_all(
     parallel: int,
     groups: tuple[str, ...],
     rsync_mirror: Path | None,
+    existing_only: bool,
     verbose: bool,
+    max_rps: float | None,
 ):
     """Convert all sessions from an IETF meeting to vCon format.
 
@@ -522,18 +605,37 @@ def convert_all(
 
         # Convert only specific groups
         ietf2vcon convert-all --meeting 121 --groups vcon --groups httpbis
+
+        # Regenerate the files already in the output directory in place, and
+        # create no new ones
+        ietf2vcon convert-all --meeting 121 --existing-only --output-dir ./ietf121
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     from rich.progress import Progress, SpinnerColumn, TextColumn
 
     from .datatracker import DataTrackerClient
+    from .materials import MaterialsDownloader
 
     setup_logging(verbose)
+    _apply_rate(max_rps)
 
     console.print(f"\n[bold]Converting IETF {meeting} to vCon[/bold]\n")
 
-    # Get groups to convert
+    problem = check_mirror(rsync_mirror, meeting)
+    if problem:
+        console.print(f"[red]Error:[/red] {escape(problem)}")
+        sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    remove_stale_partials(output_dir)
+    MaterialsDownloader.reset_counters()
+
+    # The work list: the groups the Datatracker lists for the meeting together
+    # with the groups that already have a published file. A group the
+    # Datatracker no longer lists keeps its file untouched and is reported.
+    on_disk = published_files(output_dir, meeting)
+    listed: set[str] | None = None
     if groups:
         group_list = list(groups)
         console.print(f"Converting {len(group_list)} specified groups")
@@ -542,10 +644,17 @@ def convert_all(
         client = DataTrackerClient()
         try:
             sessions = client.get_meeting_sessions(meeting)
-            group_list = sorted(set(s.group_acronym for s in sessions))
+        except SessionReadError as e:
+            console.print(f"[red]Error:[/red] could not list the sessions of IETF {meeting}: {escape(str(e))}")
+            sys.exit(1)
         finally:
             client.close()
-        console.print(f"Found [cyan]{len(group_list)}[/cyan] working groups\n")
+        if not sessions:
+            console.print(f"[red]Error:[/red] the Datatracker lists no sessions for IETF {meeting}")
+            sys.exit(1)
+        listed = {s.group_acronym for s in sessions}
+        group_list = sorted(listed | set(on_disk))
+        console.print(f"Found [cyan]{len(listed)}[/cyan] working groups\n")
 
     # Configure options
     options = ConversionOptions(
@@ -560,17 +669,67 @@ def convert_all(
         rsync_mirror_dir=rsync_mirror,
     )
 
-    def convert_group(group: str) -> tuple[str, bool, str]:
-        """Convert a single group's session."""
-        try:
-            converter = IETFSessionConverter(options)
-            result = converter.convert_session(meeting, group)
-            if result.errors:
-                return (group, False, result.errors[0])
-            output_path = converter.save_vcon(result)
-            return (group, True, str(output_path))
-        except Exception as e:
-            return (group, False, str(e))
+    chair_ambiguous: list[str] = []
+    missing_published: list[str] = []
+    no_published_file: list[str] = []
+    # A read every session depends on (meeting record, official schedule,
+    # statuses) failed: stop trying, since each remaining session would fail
+    # the same slow way.
+    stop = threading.Event()
+    stop_reason: list[str] = []
+    not_attempted = [0]
+
+    def convert_group(group: str) -> list[tuple[str, bool, str]]:
+        """Convert a group's session(s).
+
+        A group that already has files in the output directory is regenerated
+        in place: one conversion per previous file, by the session id in its
+        name, so filenames and uuids do not move. A group with none gets the
+        session ``choose_session`` picks (or, with --existing-only, nothing).
+        """
+        outcomes = []
+        converter = IETFSessionConverter(options)
+        previous = converter.previous_session_ids(meeting, group)
+        if listed is not None and group not in listed:
+            # The Datatracker no longer lists the group: leave its files alone.
+            for session_id in previous:
+                label = f"{group}:{session_id}" if len(previous) > 1 else group
+                logger.warning(
+                    "Published session not found: %s has files but the Datatracker "
+                    "no longer lists it at IETF %s; left untouched", group, meeting,
+                )
+                missing_published.append(label)
+                outcomes.append((label, True, "group no longer listed; file untouched"))
+            return outcomes
+        if existing_only and not previous:
+            no_published_file.append(group)
+            return outcomes
+        targets = previous or [None]
+        for position, session_id in enumerate(targets):
+            label = group if len(previous) <= 1 else f"{group}:{session_id}"
+            if stop.is_set():
+                not_attempted[0] += len(targets) - position
+                break
+            try:
+                result = converter.convert_session(meeting, group, session_id=session_id)
+                if result.meeting_wide_failure:
+                    if not stop.is_set():
+                        stop_reason.append(result.errors[0] if result.errors else "unknown")
+                    stop.set()
+                if result.chair_ambiguous:
+                    chair_ambiguous.append(label)
+                if result.published_session_missing:
+                    missing_published.append(label)
+                    outcomes.append((label, True, "published session not found; file untouched"))
+                    continue
+                if result.errors:
+                    outcomes.append((label, False, result.errors[0]))
+                    continue
+                output_path = converter.save_vcon(result)
+                outcomes.append((label, True, str(output_path)))
+            except Exception as e:
+                outcomes.append((label, False, str(e)))
+        return outcomes
 
     # Convert sessions
     results = []
@@ -589,14 +748,12 @@ def convert_all(
                 }
                 for future in as_completed(futures):
                     group = futures[future]
-                    result = future.result()
-                    results.append(result)
+                    results.extend(future.result())
                     progress.update(task, advance=1, description=f"Converted {group}")
         else:
             for group in group_list:
                 progress.update(task, description=f"Converting {group}...")
-                result = convert_group(group)
-                results.append(result)
+                results.extend(convert_group(group))
                 progress.update(task, advance=1)
 
     # Display results
@@ -608,17 +765,63 @@ def convert_all(
     table.add_column("Output/Error")
 
     success_count = 0
+    failures = []
     for group, success, message in sorted(results):
         if success:
             success_count += 1
-            table.add_row(group, "[green]✓[/green]", message[:60])
+            table.add_row(group, "[green]✓[/green]", escape(message[:60]))
         else:
-            table.add_row(group, "[red]✗[/red]", message[:60])
+            failures.append((group, message))
+            table.add_row(group, "[red]✗[/red]", escape(message[:60]))
 
     console.print(table)
     console.print(f"\n[bold]Summary:[/bold] {success_count}/{len(results)} successful")
+    if failures:
+        console.print(f"[red]{len(failures)} session(s) failed; their published files are untouched:[/red]")
+        for group, message in failures:
+            console.print(f"  [red]{escape(group)}[/red]: {escape(message)}")
+    if stop.is_set():
+        console.print(
+            f"[red]Run stopped at the first meeting-wide read failure:[/red] "
+            f"{escape(stop_reason[0])}"
+        )
+        console.print(
+            f"[red]{not_attempted[0]} session(s) not attempted[/red]; their files are untouched. "
+            "Run the meeting again once the Datatracker answers."
+        )
+    if missing_published:
+        console.print(
+            f"[yellow]Published session not found for {len(missing_published)} "
+            f"file(s), left untouched: {escape(', '.join(sorted(missing_published)))}[/yellow]"
+        )
+    if no_published_file:
+        console.print(
+            f"[yellow]No published file for {len(no_published_file)} group(s), skipped "
+            f"(--existing-only): {escape(', '.join(sorted(no_published_file)))}[/yellow]"
+        )
+    if chair_ambiguous:
+        console.print(
+            f"[yellow]Chairs ambiguous, omitted for {len(chair_ambiguous)} "
+            f"session(s): {escape(', '.join(sorted(chair_ambiguous)))}[/yellow]"
+        )
+    console.print(
+        f"Materials: {MaterialsDownloader.mirror_served} from the mirror, "
+        f"{MaterialsDownloader.http_fetched} over HTTP"
+    )
+    console.print(MaterialsDownloader.not_available_summary())
+    logger.info(
+        "Materials: %d from the mirror, %d over HTTP; %s",
+        MaterialsDownloader.mirror_served, MaterialsDownloader.http_fetched,
+        MaterialsDownloader.not_available_summary(),
+    )
 
-    if success_count < len(results):
+    if existing_only and not results:
+        console.print(
+            "[red]Error:[/red] --existing-only found no published file to regenerate; "
+            f"is {escape(str(output_dir))} the right output directory?"
+        )
+        sys.exit(1)
+    if failures:
         sys.exit(1)
 
 

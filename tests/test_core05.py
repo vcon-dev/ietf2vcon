@@ -43,6 +43,64 @@ def check(validator, tmp_path, builder):
     return json.loads(path.read_text())
 
 
+def test_full_vcon_has_no_undefined_meta_and_declares_cc(
+    validator, tmp_path, sample_ietf_meeting, sample_ietf_session, sample_video_metadata,
+    sample_chat_messages, sample_transcription_result, sample_materials,
+):
+    b = full_builder(
+        sample_ietf_meeting, sample_ietf_session, sample_video_metadata,
+        sample_chat_messages, sample_transcription_result, sample_materials,
+    )
+    data = check(validator, tmp_path, b)
+    assert sorted(data["extensions"]) == ["CC", "lawful_basis", "wtf_transcription"]
+    for kind in ("parties", "dialog", "attachments"):
+        assert all("meta" not in item for item in data[kind])
+    for att in data["attachments"]:
+        if att.get("body") is not None:
+            assert att["mediatype"] == "application/json"
+
+
+def test_chat_log_attachment_is_json_with_mediatype(
+    validator, tmp_path, monkeypatch, sample_ietf_meeting, sample_ietf_session,
+    sample_chat_messages,
+):
+    """With chat_as_dialog off, the chat log is an inline JSON attachment."""
+    from ietf2vcon import converter as converter_module
+    from ietf2vcon.converter import ConversionOptions, IETFSessionConverter
+
+    class FakeZulip:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_session_messages(self, *args):
+            return sample_chat_messages
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(converter_module, "ZulipClient", FakeZulip)
+    converter = IETFSessionConverter(ConversionOptions(
+        output_dir=tmp_path, chat_as_dialog=False,
+        zulip_email="x@example.com", zulip_api_key="k",
+    ))
+    b = VConBuilder()
+    b.set_meeting_metadata(sample_ietf_meeting, sample_ietf_session)
+    b.add_ingress_info()
+    b.add_ietf_note_well()
+    b.add_attendees_party()
+    errors = []
+    assert converter._process_chat(b, sample_ietf_session, errors, []) == 2
+    assert not errors
+
+    data = check(validator, tmp_path, b)
+    chat = next(a for a in data["attachments"] if a["purpose"] == "chat_log")
+    assert chat["encoding"] == "json"
+    assert chat["mediatype"] == "application/json"
+    assert [m["content"] for m in json.loads(chat["body"])] == [
+        m.content for m in sample_chat_messages
+    ]
+
+
 def test_full_vcon_is_core05(
     validator, tmp_path, sample_ietf_meeting, sample_ietf_session, sample_video_metadata,
     sample_chat_messages, sample_transcription_result, sample_materials,

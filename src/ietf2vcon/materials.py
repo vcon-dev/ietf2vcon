@@ -7,19 +7,49 @@ import hashlib
 import logging
 import mimetypes
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
 
+from .errors import MaterialFetchError
 from .hashing import content_hash_token
+from .httpclient import get_with_retries
 from .models import IETFMaterial
 from .rsync_mirror import find_local_file
 
 logger = logging.getLogger(__name__)
 
+# A response that says the document is not there. Anything else that goes
+# wrong (a timeout, a refused connection, 429, 5xx after the retries) is a
+# failure to find out, not an answer, and fails the session.
+NOT_AVAILABLE_STATUSES = {403, 404, 410}
+
 
 class MaterialsDownloader:
     """Download and manage IETF meeting materials."""
+
+    # Where materials came from in this process, for the end-of-run summary.
+    mirror_served = 0
+    http_fetched = 0
+    # HTTP status -> how many materials the server said are not available. A
+    # 403 can mean the client is being blocked, so these are counted, not just
+    # logged.
+    not_available: dict[int, int] = {}
+
+    @classmethod
+    def reset_counters(cls) -> None:
+        cls.mirror_served = 0
+        cls.http_fetched = 0
+        cls.not_available = {}
+
+    @classmethod
+    def not_available_summary(cls) -> str:
+        """"Materials not available: 59 (404: 59)", for the end-of-run summary."""
+        total = sum(cls.not_available.values())
+        if not total:
+            return "Materials not available: 0"
+        detail = ", ".join(f"{code}: {n}" for code, n in sorted(cls.not_available.items()))
+        return f"Materials not available: {total} ({detail})"
 
     def __init__(
         self,
@@ -27,8 +57,9 @@ class MaterialsDownloader:
         timeout: float = 60.0,
         mirror_dir: Path | None = None,
     ):
+        # Created when a file is first written, not here: fetch_material() does
+        # not write to it, and an empty directory per run is clutter.
         self.download_dir = download_dir or Path("./materials")
-        self.download_dir.mkdir(parents=True, exist_ok=True)
         self.mirror_dir = mirror_dir
         self.client = httpx.Client(timeout=timeout, follow_redirects=True)
 
@@ -68,7 +99,6 @@ class MaterialsDownloader:
         doc_name = material.url.rstrip("/").split("/")[-1].split("?")[0]
         return find_local_file(doc_name, meeting_number, self.mirror_dir)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def download_material(self, material: IETFMaterial) -> Path | None:
         """Download a single material file.
 
@@ -86,6 +116,7 @@ class MaterialsDownloader:
         if local_path:
             logger.info("Using mirror: %s", local_path)
             # Copy to download_dir so callers get a consistent location
+            self.download_dir.mkdir(parents=True, exist_ok=True)
             dest = self.download_dir / local_path.name
             if not dest.exists():
                 import shutil
@@ -95,8 +126,7 @@ class MaterialsDownloader:
         try:
             logger.info(f"Downloading: {material.title} from {material.url}")
 
-            response = self.client.get(material.url)
-            response.raise_for_status()
+            response = get_with_retries(self.client, material.url)
 
             # Determine filename
             filename = material.filename
@@ -119,6 +149,7 @@ class MaterialsDownloader:
                     filename = f"{filename}{ext}"
 
             # Save file
+            self.download_dir.mkdir(parents=True, exist_ok=True)
             output_path = self.download_dir / filename
             output_path.write_bytes(response.content)
 
@@ -175,18 +206,38 @@ class MaterialsDownloader:
         local = self._mirror_path(material)
         if local:
             logger.info("Using mirror: %s", local)
+            MaterialsDownloader.mirror_served += 1
             mediatype, _ = mimetypes.guess_type(local.name)
             return local.read_bytes(), mediatype, local.name
+        if material.type == "document":
+            # The catch-all type (session polls, for one) has no proceedings
+            # directory of its own, so the verbatim URL built for it points at
+            # a directory that does not exist and always answers 404. The
+            # material stays a reference in the attachment body.
+            logger.info("Not fetching %s: no published file location", material.url)
+            return None, None, None
         # Fetch the verbatim file where one is known. The Datatracker material
         # URL renders and converts, so hashing what it returns would describe a
         # view rather than the published document.
         target = material.file_url or material.url
         try:
-            response = self.client.get(target)
-            response.raise_for_status()
-        except Exception as e:
-            logger.error(f"Failed to fetch {target}: {e}")
-            return None, None, None
+            response = get_with_retries(self.client, target)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status in NOT_AVAILABLE_STATUSES:
+                # The server says the document is not there: an answer. The
+                # material falls back to a body reference.
+                logger.warning(f"Could not fetch {target}: HTTP {status}")
+                MaterialsDownloader.not_available[status] = (
+                    MaterialsDownloader.not_available.get(status, 0) + 1
+                )
+                return None, None, None
+            raise MaterialFetchError(f"could not fetch {target}: HTTP {status}") from e
+        except httpx.HTTPError as e:
+            raise MaterialFetchError(
+                f"could not fetch {target}: {type(e).__name__}: {e}"
+            ) from e
+        MaterialsDownloader.http_fetched += 1
 
         mediatype = (response.headers.get("content-type") or "").split(";")[0].strip() or None
         # www.ietf.org serves Markdown as application/octet-stream. That is the
@@ -195,10 +246,16 @@ class MaterialsDownloader:
         if mediatype in (None, "application/octet-stream"):
             guessed, _ = mimetypes.guess_type(material.uploaded_filename or material.url)
             mediatype = guessed or mediatype
+        # The name of the file actually read: the fetched URL's own last
+        # segment when it names a file, else what the server calls it.
         filename = None
-        disposition = response.headers.get("content-disposition", "")
-        if "filename=" in disposition:
-            filename = disposition.split("filename=")[-1].strip('"; ')
+        segment = unquote(urlparse(target).path.rsplit("/", 1)[-1])
+        if Path(segment).suffix:
+            filename = segment
+        else:
+            disposition = response.headers.get("content-disposition", "")
+            if "filename=" in disposition:
+                filename = disposition.split("filename=")[-1].strip('"; ')
         return response.content, mediatype, filename
 
     def compute_hash(self, content: bytes, algorithm: str = "sha512") -> str:

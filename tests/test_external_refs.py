@@ -14,6 +14,7 @@ import json
 import pytest
 
 from ietf2vcon.hashing import content_hash_token
+from ietf2vcon.materials import MaterialsDownloader
 from ietf2vcon.models import IETFMaterial
 from ietf2vcon.vcon_builder import VConBuilder
 
@@ -36,7 +37,23 @@ SESSION_PAGE = IETFMaterial(
 
 @pytest.fixture
 def builder():
-    return VConBuilder()
+    from ietf2vcon.models import IETFMeeting, IETFSession
+
+    b = VConBuilder()
+    b.set_meeting_metadata(
+        IETFMeeting(number=108),
+        IETFSession(meeting_number=108, group_acronym="gaia", session_id="1"),
+    )
+    return b
+
+
+def materials_info(builder):
+    """The materials member of the meeting_metadata body."""
+    att = next(
+        a for a in builder.vcon.vcon_dict["attachments"]
+        if a["purpose"] == "meeting_metadata"
+    )
+    return json.loads(att["body"]).get("materials", [])
 
 
 def attachments(builder):
@@ -58,10 +75,13 @@ def test_fetched_material_becomes_an_external_reference(builder):
     assert att["content_hash"] == content_hash_token(b"slide deck bytes")
     assert att["mediatype"] == "application/pdf"
     assert att["filename"] == SLIDES.filename
-    assert att["meta"]["title"] == SLIDES.title
+    assert "meta" not in att
+    assert materials_info(builder) == [
+        {"filename": SLIDES.filename, "title": SLIDES.title, "url": SLIDES.url}
+    ]
     # The whole point: no opaque JSON blob standing in for a linked document.
     assert "body" not in att or att["body"] is None
-    assert "meta" in builder.vcon.vcon_dict["extensions"]
+    assert "meta" not in builder.vcon.vcon_dict.get("extensions", [])
 
 
 def test_landing_page_stays_a_body_reference(builder):
@@ -288,7 +308,8 @@ class TestVerifiableReferences:
 
         assert attachment["url"] == material.file_url
         assert attachment["content_hash"].startswith("sha512-")
-        assert attachment["meta"]["datatracker_url"] == material.url
+        assert "meta" not in attachment
+        assert materials_info(builder)[-1]["datatracker_url"] == material.url
 
     def test_page_is_kept_for_a_human_to_open(self, builder):
         from ietf2vcon.models import IETFMaterial
@@ -302,9 +323,10 @@ class TestVerifiableReferences:
             mimetype="text/markdown",
         )
         builder.add_material_attachment(material, content=b"# agenda")
-        meta = builder.vcon.vcon_dict["attachments"][-1]["meta"]
-        assert meta["title"] == "VCON Agenda"
-        assert "datatracker.ietf.org" in meta["datatracker_url"]
+        assert "meta" not in builder.vcon.vcon_dict["attachments"][-1]
+        info = materials_info(builder)[-1]
+        assert info["title"] == "VCON Agenda"
+        assert "datatracker.ietf.org" in info["datatracker_url"]
 
     def test_no_file_url_falls_back_to_the_page(self, builder):
         """Older documents have no uploaded_filename; the page is all there is."""
@@ -319,7 +341,81 @@ class TestVerifiableReferences:
         builder.add_material_attachment(material, content=b"deck")
         attachment = builder.vcon.vcon_dict["attachments"][-1]
         assert attachment["url"] == material.url
-        assert "datatracker_url" not in attachment.get("meta", {})
+        assert "meta" not in attachment
+        assert "datatracker_url" not in materials_info(builder)[-1]
+
+
+class TestMaterialsInMeetingMetadata:
+    """core-05 has no attachment meta; titles live in meeting_metadata.materials."""
+
+    def _material(self, kind, name, title, url=None):
+        return IETFMaterial(
+            type=kind, title=title,
+            url=f"https://datatracker.ietf.org/meeting/108/materials/{name}",
+            file_url=url or f"https://www.ietf.org/proceedings/108/{kind}/{name}.pdf",
+            filename=f"{name}.pdf", mimetype="application/pdf",
+        )
+
+    def test_no_attachment_has_meta_and_entries_follow_attachment_order(self, builder):
+        builder.add_material_attachment(self._material("slides", "a", "First"), content=b"1")
+        builder.add_material_attachment(self._material("slides", "b", "Second"), content=b"2")
+
+        assert all("meta" not in a for a in attachments(builder))
+        assert [m["filename"] for m in materials_info(builder)] == ["a.pdf", "b.pdf"]
+        assert [m["title"] for m in materials_info(builder)] == ["First", "Second"]
+
+    def test_meeting_metadata_keeps_its_position_and_stays_a_json_string(self, builder):
+        builder.add_ingress_info()
+        builder.add_material_attachment(self._material("slides", "a", "First"), content=b"1")
+
+        assert [a["purpose"] for a in attachments(builder)] == [
+            "meeting_metadata", "ingress_info", "slides",
+        ]
+        first = attachments(builder)[0]
+        assert isinstance(first["body"], str) and first["mediatype"] == "application/json"
+
+    def test_missing_values_are_omitted_not_null(self, builder):
+        material = IETFMaterial(
+            type="slides", title="", url="https://www.ietf.org/proceedings/108/slides/a.pdf",
+            filename="a.pdf", mimetype="application/pdf",
+        )
+        builder.add_material_attachment(material, content=b"1")
+        assert materials_info(builder) == [{"filename": "a.pdf", "url": material.url}]
+
+        builder.add_material_attachment(self._material("slides", "b", "Titled"), content=b"2")
+        assert len(materials_info(builder)) == 2
+        assert all(v is not None for m in materials_info(builder) for v in m.values())
+
+    def test_one_entry_per_external_reference_in_attachment_order(self, builder):
+        builder.add_material_attachment(SESSION_PAGE)  # body reference: no entry
+        builder.add_material_attachment(self._material("slides", "a", "First"), content=b"1")
+        builder.add_material_attachment(
+            IETFMaterial(type="slides", title="", url="https://www.ietf.org/p/b.pdf",
+                         filename="b.pdf", mimetype="application/pdf"),
+            content=b"2",
+        )
+        external = [a["url"] for a in attachments(builder) if "url" in a]
+        assert [m["url"] for m in materials_info(builder)] == external
+
+    def test_url_tells_apart_two_materials_with_one_filename(self, builder):
+        """An agenda and minutes can both be published as ntp.txt."""
+        for kind in ("agenda", "minutes"):
+            builder.add_material_attachment(
+                IETFMaterial(
+                    type=kind, title=kind.title(),
+                    url=f"https://datatracker.ietf.org/meeting/67/materials/{kind}-67-ntp",
+                    file_url=f"https://www.ietf.org/proceedings/67/{kind}/ntp.txt",
+                    filename="ntp.txt", mimetype="text/plain",
+                ),
+                content=b"x",
+            )
+        urls = [m["url"] for m in materials_info(builder)]
+        assert len(set(urls)) == 2
+
+    def test_fallback_body_attachment_is_inline_with_mediatype(self, builder):
+        builder.add_material_attachment(SESSION_PAGE)
+        att = attachments(builder)[-1]
+        assert att["encoding"] == "json" and att["mediatype"] == "application/json"
 
 
 class TestFormatTieBreak:
@@ -432,3 +528,114 @@ class TestHtmlIsNeverHashed:
         attachment = builder.vcon.vcon_dict["attachments"][-1]
         assert "content_hash" not in attachment
         assert attachment["encoding"] == "json"
+
+
+class TestUrlNamesTheFileThatWasHashed:
+    """url, filename, mediatype and content_hash describe the one file whose bytes were read."""
+
+    PDF, PPTX = b"%PDF-1.7 deck", b"PK\x03\x04 pptx deck"
+
+    def _material(self, **overrides):
+        base = dict(
+            type="slides", title="Deck",
+            url="https://datatracker.ietf.org/meeting/92/materials/slides-92-supa-2",
+            file_url="https://www.ietf.org/proceedings/92/slides/slides-92-supa-2.pdf",
+            filename="slides-92-supa-2.pdf", mimetype="application/pdf",
+            uploaded_filename="slides-92-supa-2.pdf",
+        )
+        base.update(overrides)
+        return IETFMaterial(**base)
+
+    def _mirror(self, tmp_path, *files):
+        directory = tmp_path / "mirror" / "proceedings" / "92" / "slides"
+        directory.mkdir(parents=True)
+        for name, data in files:
+            (directory / name).write_bytes(data)
+        return tmp_path / "mirror"
+
+    def _attachment(self, builder):
+        return next(
+            a for a in builder.vcon.vcon_dict["attachments"] if a["purpose"] == "slides"
+        )
+
+    def test_a_sibling_found_in_the_mirror_gets_a_url_that_names_it(self, builder, tmp_path):
+        """The Datatracker says .pdf; the mirror (and ietf.org) hold only the .pptx."""
+        mirror = self._mirror(tmp_path, ("slides-92-supa-2.pptx", self.PPTX))
+        downloader = MaterialsDownloader(tmp_path / "m", mirror_dir=mirror)
+        builder.add_materials([self._material()], downloader=downloader)
+        att = self._attachment(builder)
+
+        assert att["url"] == "https://www.ietf.org/proceedings/92/slides/slides-92-supa-2.pptx"
+        assert att["filename"] == "slides-92-supa-2.pptx"
+        assert att["mediatype"].endswith("presentationml.presentation")
+        assert att["content_hash"] == content_hash_token(self.PPTX)
+        entry = next(m for m in materials_info(builder) if m["filename"] == att["filename"])
+        assert entry["url"] == att["url"]
+
+    def test_both_formats_in_the_mirror_still_give_a_consistent_pdf_reference(self, builder, tmp_path):
+        """The common case: the Datatracker names the .pdf and the mirror holds both."""
+        mirror = self._mirror(
+            tmp_path, ("slides-92-supa-2.pdf", self.PDF), ("slides-92-supa-2.pptx", self.PPTX)
+        )
+        downloader = MaterialsDownloader(tmp_path / "m", mirror_dir=mirror)
+        builder.add_materials([self._material()], downloader=downloader)
+        att = self._attachment(builder)
+
+        assert att["url"] == "https://www.ietf.org/proceedings/92/slides/slides-92-supa-2.pdf"
+        assert att["filename"] == "slides-92-supa-2.pdf" and att["mediatype"] == "application/pdf"
+        assert att["content_hash"] == content_hash_token(self.PDF)
+
+    def test_a_name_with_a_space_is_quoted_in_the_url(self, builder):
+        material = self._material(filename="slides 92 supa.pptx")
+        builder.add_material_attachment(material, content=self.PPTX)
+        att = self._attachment(builder)
+        assert att["url"] == "https://www.ietf.org/proceedings/92/slides/slides%2092%20supa.pptx"
+        assert att["filename"] == "slides 92 supa.pptx"
+
+    def test_a_url_that_cannot_be_formed_falls_back_to_an_unhashed_body_reference(
+        self, builder, caplog
+    ):
+        material = self._material(file_url="not-a-url/slides-92-supa-2.pdf", filename="other.pptx")
+        with caplog.at_level("WARNING", logger="ietf2vcon.vcon_builder"):
+            builder.add_material_attachment(material, content=self.PPTX)
+        att = self._attachment(builder)
+
+        assert "url" not in att and "content_hash" not in att
+        assert att["encoding"] == "json"
+        assert json.loads(att["body"])["url"] == material.url
+        assert any("other.pptx" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+    def test_an_older_document_with_no_file_url_keeps_the_page_url(self, builder):
+        material = self._material(file_url=None, uploaded_filename=None, filename="16ng-0.ppt")
+        builder.add_material_attachment(material, content=b"deck")
+        att = self._attachment(builder)
+        assert att["url"] == material.url and att["filename"] == "16ng-0.ppt"
+
+    def test_a_server_supplied_name_does_not_override_the_fetched_url(self, builder, tmp_path):
+        """The URL fetched names the file; a differing Content-Disposition does not rename it."""
+        import httpx
+
+        downloader = MaterialsDownloader(tmp_path / "m")
+        downloader.client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, content=self.PDF,
+            headers={"content-type": "application/pdf",
+                     "content-disposition": 'attachment; filename="download.pdf"'},
+        )))
+        builder.add_materials([self._material()], downloader=downloader)
+        att = self._attachment(builder)
+        assert att["filename"] == "slides-92-supa-2.pdf"
+        assert att["url"].endswith("/slides-92-supa-2.pdf")
+
+    def test_the_filename_read_from_a_page_url_comes_from_the_server(self, builder, tmp_path):
+        """No file name in the fetched URL, so Content-Disposition is what names the file."""
+        import httpx
+
+        downloader = MaterialsDownloader(tmp_path / "m")
+        downloader.client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, content=b"deck", headers={
+                "content-type": "application/vnd.ms-powerpoint",
+                "content-disposition": 'attachment; filename="16ng-0.ppt"'},
+        )))
+        material = self._material(file_url=None, uploaded_filename=None, filename=None)
+        _, _, name = downloader.fetch_material(material)
+        assert name == "16ng-0.ppt"

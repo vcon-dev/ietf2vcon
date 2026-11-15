@@ -6,14 +6,17 @@ into a complete vCon document.
 
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from vcon import Vcon
 
-from .datatracker import DataTrackerClient
+from .datatracker import MET_STATUS, DataTrackerClient
+from .errors import CarryOverError, MeetingReadError, SessionReadError
 from .materials import MaterialsDownloader, organize_materials_by_type
 from .models import IETFMeeting, IETFSession, MeetingNumber
 from .transcription import (
@@ -81,9 +84,10 @@ class ConversionOptions:
     preserve_uuid: bool = True
 
     # Carry an existing vCon's transcript across a regeneration that did not
-    # produce one of its own. Re-running ASR yields different text, and a
-    # regeneration meant to fix attachment structure should not silently
-    # rewrite -- or drop -- what was said.
+    # produce one of its own, and its recording Dialog when the new build has
+    # none. Re-running ASR yields different text, and a regeneration meant to
+    # fix attachment structure should not silently rewrite -- or drop -- what
+    # was said or the recording it was said in.
     preserve_analysis: bool = True
 
     # Authentication (for Zulip)
@@ -105,6 +109,103 @@ class ConversionResult:
     chat_message_count: int = 0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    chair_ambiguous: bool = False
+    # A published file's session id is no longer in the Datatracker's list;
+    # nothing was converted and the file must be left alone.
+    published_session_missing: bool = False
+    # The failure came from a read every session of the meeting depends on, so
+    # a batch run stops instead of trying the rest.
+    meeting_wide_failure: bool = False
+
+
+def finalize_vcon(vcon_dict: dict) -> dict:
+    """Put a document in its final shape.
+
+    The four content arrays and the sessions array are always present, as in
+    the published files. ``encoding`` belongs to an inline ``body`` (core-05
+    2.3.2), so an attachment, Dialog or analysis entry with no body has none.
+    """
+    for key in ("parties", "dialog", "attachments", "analysis", "sessions"):
+        if not isinstance(vcon_dict.get(key), list):
+            vcon_dict[key] = []
+    for key in ("dialog", "attachments", "analysis"):
+        for item in vcon_dict[key]:
+            if isinstance(item, dict) and item.get("body") is None:
+                item.pop("encoding", None)
+    return vcon_dict
+
+
+def vcon_file_text(vcon: Vcon) -> str:
+    """The published file layout: two-space indent, raw UTF-8, one trailing newline."""
+    return json.dumps(finalize_vcon(vcon.vcon_dict), indent=2, ensure_ascii=False) + "\n"
+
+
+PARTIAL_SUFFIX = ".partial"
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write a file so it is either entirely the old content or entirely the new.
+
+    The text goes to a temporary file in the same directory (hidden, and not
+    named ``*.vcon.json``, so nothing mistakes it for a vCon), is flushed and
+    fsynced, and then replaces the target with ``os.replace``. A temporary
+    file left by a failure is removed.
+    """
+    temporary = path.with_name(f".{path.name}.{os.getpid()}{PARTIAL_SUFFIX}")
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def remove_stale_partials(directory: Path) -> list[Path]:
+    """Delete temporary files left in ``directory`` by a run that was killed."""
+    removed = []
+    for path in sorted(directory.glob(f".*.vcon.json.*{PARTIAL_SUFFIX}")):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        logger.warning("Removed a temporary file left by an interrupted run: %s", path.name)
+        removed.append(path)
+    return removed
+
+
+def replacement_problems(previous: dict, new: dict, options: "ConversionOptions") -> list[str]:
+    """Why ``new`` must not replace ``previous`` (empty when it may).
+
+    A published file's uuid and creation time are public identifiers, and a
+    regeneration that carries content over must not lose any of it.
+    """
+    problems = []
+    if options.preserve_uuid:
+        if previous.get("uuid") != new.get("uuid"):
+            problems.append(
+                f"uuid would change from {previous.get('uuid')} to {new.get('uuid')}"
+            )
+        if previous.get("created_at") and previous.get("created_at") != new.get("created_at"):
+            problems.append(
+                f"created_at would change from {previous.get('created_at')} "
+                f"to {new.get('created_at')}"
+            )
+    if options.preserve_analysis:
+        if previous.get("dialog") and not new.get("dialog"):
+            problems.append("it has a recording Dialog and the new document has none")
+        had = len(previous.get("analysis") or [])
+        if len(new.get("analysis") or []) < had:
+            problems.append(
+                f"it has {had} analysis entries and the new document has "
+                f"{len(new.get('analysis') or [])}"
+            )
+    return problems
 
 
 class IETFSessionConverter:
@@ -114,18 +215,68 @@ class IETFSessionConverter:
         self.options = options or ConversionOptions()
         self.options.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def remove_stale_partials(self) -> list[Path]:
+        """Clean up temporary files an interrupted run left in the output directory."""
+        return remove_stale_partials(self.options.output_dir)
+
+    @staticmethod
+    def _by_id(sessions: list[IETFSession]) -> list[IETFSession]:
+        """Sessions in ascending integer id, so positions never depend on the API."""
+        def key(s: IETFSession):
+            return (0, int(s.session_id), "") if s.session_id.isdigit() else (1, 0, s.session_id)
+
+        return sorted(sessions, key=key)
+
+    @classmethod
+    def choose_session(cls, sessions: list[IETFSession]) -> IETFSession:
+        """The session to convert for a group that has no previous file.
+
+        A session that actually met comes first: its status is "sched", or
+        unknown. Among those, the earliest official start wins (a session with
+        no start after those with one), then the lowest integer id. If none
+        met, the lowest id.
+        """
+        ordered = cls._by_id(sessions)
+        met = [s for s in ordered if s.status in (None, MET_STATUS)]
+        if not met:
+            return ordered[0]
+        return min(
+            met,
+            key=lambda s: (s.start_time is None, s.start_time or datetime.max.replace(tzinfo=UTC)),
+        )
+
+    def previous_session_ids(
+        self, meeting_number: MeetingNumber, group_acronym: str
+    ) -> list[str]:
+        """Session ids of the files this meeting and group already have in output_dir."""
+        pattern = re.compile(
+            rf"^{re.escape(self._meeting_slug(meeting_number))}_"
+            rf"{re.escape(group_acronym)}_(\d+)\.vcon\.json$"
+        )
+        found = [
+            m.group(1) for path in self.options.output_dir.iterdir()
+            if (m := pattern.match(path.name))
+        ]
+        return sorted(found, key=int)
+
     def convert_session(
         self,
         meeting_number: MeetingNumber,
         group_acronym: str,
-        session_index: int = 0,
+        session_index: int | None = None,
+        session_id: str | None = None,
     ) -> ConversionResult:
         """Convert an IETF session to vCon.
 
         Args:
             meeting_number: IETF meeting number (e.g., 124)
             group_acronym: Working group acronym (e.g., "vcon")
-            session_index: Index if multiple sessions (0 for first/only)
+            session_index: Position among the group's sessions in id order
+            session_id: Convert this session id (a previously published file's
+                id). If the Datatracker no longer lists it, nothing is
+                converted and ``published_session_missing`` is set.
+
+        With neither, the session is chosen by ``choose_session``.
 
         Returns:
             ConversionResult with the vCon and metadata
@@ -134,19 +285,24 @@ class IETFSessionConverter:
         warnings = []
 
         logger.info(
-            "Converting IETF %s %s session %d",
-            meeting_number, group_acronym, session_index,
+            "Converting IETF %s %s session %s",
+            meeting_number, group_acronym,
+            session_id if session_id is not None else (
+                session_index if session_index is not None else "(chosen)"
+            ),
         )
 
         # Initialize clients
         datatracker = DataTrackerClient()
+        where = f"{group_acronym} at IETF {meeting_number}"
+        chosen_id = str(session_id) if session_id is not None else ""
 
         try:
-            # Get meeting info
+            # Get meeting info. Without the meeting record nothing can be
+            # dated, so a missing or unreadable one fails the session.
             meeting = datatracker.get_meeting(meeting_number)
             if not meeting:
-                meeting = IETFMeeting(number=meeting_number)
-                warnings.append(f"Could not fetch meeting {meeting_number} metadata")
+                raise MeetingReadError(f"the Datatracker has no meeting {meeting_number}")
 
             # Get sessions for the group.
             #
@@ -175,13 +331,36 @@ class IETFSessionConverter:
                     group_acronym=group_acronym, session_id="",
                     errors=errors, warnings=warnings,
                 )
-            if session_index < len(sessions):
+            sessions = self._by_id(sessions)
+            if session_id is not None:
+                match = [s for s in sessions if s.session_id == str(session_id)]
+                if not match:
+                    filename = self._session_filename(meeting_number, group_acronym, str(session_id))
+                    message = (
+                        f"Published session not found: {filename} is for session "
+                        f"{session_id}, which {group_acronym} no longer has at IETF "
+                        f"{meeting_number}; the file is left untouched"
+                    )
+                    logger.warning(message)
+                    warnings.append(message)
+                    return ConversionResult(
+                        vcon=VConBuilder().build(), meeting_number=meeting_number,
+                        group_acronym=group_acronym, session_id=str(session_id),
+                        errors=errors, warnings=warnings, published_session_missing=True,
+                    )
+                session = match[0]
+            elif session_index is None:
+                session = self.choose_session(sessions)
+            elif session_index < len(sessions):
                 session = sessions[session_index]
             else:
                 session = sessions[0]
                 warnings.append(
                     f"Session index {session_index} not found, using first session"
                 )
+            session_index = sessions.index(session)
+            chosen_id = session.session_id
+            where = f"{group_acronym} session {chosen_id} at IETF {meeting_number}"
 
             # Initialize builder
             builder = VConBuilder()
@@ -198,14 +377,43 @@ class IETFSessionConverter:
 
             # Add chairs as parties. The session start time matters: without
             # it the Datatracker returns today's chairs, so a 2014 session
-            # would credit whoever chairs the group now. When the schedule
-            # lookup did not yield a start time we cannot date the roles, so
-            # no chairs are asserted rather than today's being assumed.
+            # would credit whoever chairs the group now. A session with no
+            # scheduled time is dated by its meeting's first day instead
+            # (meeting.start_date, the Datatracker's `date` field), taking the
+            # end of that day so a change made that morning counts. With
+            # neither date known the roles cannot be dated, so no chairs are
+            # asserted rather than today's being assumed.
             session_date = session.start_time
+            if session_date is None and meeting.start_date:
+                day = meeting.start_date
+                session_date = datetime(
+                    day.year, day.month, day.day, 23, 59, 59, tzinfo=UTC
+                )
+                logger.info(
+                    "Session %s of %s has no start time; looking up chairs as of "
+                    "the end of the meeting's first day (%s)",
+                    session.session_id, group_acronym, session_date.isoformat(),
+                )
+            chair_ambiguous = False
             if session_date:
+                # A failed read raises (and fails the session); an empty list
+                # is a definitive "no chairs".
                 chairs = datatracker.get_group_chairs(group_acronym, session_date=session_date)
+                chair_ambiguous = (
+                    getattr(datatracker, "last_chair_ambiguous", False) is True
+                )
+                if chair_ambiguous:
+                    warnings.append(
+                        "Chair history is ambiguous (snapshots sharing one time hold "
+                        "different chairs); chairs omitted."
+                    )
             else:
                 chairs = []
+                logger.warning(
+                    "Session %s of %s at IETF %s has no start time and the meeting "
+                    "date is unknown; chairs left unset",
+                    session.session_id, group_acronym, meeting_number,
+                )
                 warnings.append(
                     "Session start time unknown; chairs left unset rather than "
                     "asserting the current ones"
@@ -257,8 +465,10 @@ class IETFSessionConverter:
                     if recording_url is None and audio_url:
                         recording_url = audio_url
                         recording_mediatype = "audio/mpeg"
+                except SessionReadError:
+                    raise
                 except Exception as e:
-                    logger.warning("Failed to fetch materials: %s", e)
+                    raise SessionReadError(f"could not read the materials list: {e}") from e
 
             # Process video
             video_url = None
@@ -300,6 +510,7 @@ class IETFSessionConverter:
             self._carry_over_previous(
                 vcon, meeting_number, group_acronym, session.session_id, warnings
             )
+            finalize_vcon(vcon.vcon_dict)
 
             return ConversionResult(
                 vcon=vcon,
@@ -312,6 +523,20 @@ class IETFSessionConverter:
                 chat_message_count=chat_count,
                 errors=errors,
                 warnings=warnings,
+                chair_ambiguous=chair_ambiguous,
+            )
+
+        except (SessionReadError, CarryOverError) as e:
+            # Nothing is saved for a session that could not be read completely
+            # or whose published file cannot safely be regenerated.
+            message = f"{where}: {e}"
+            logger.error(message)
+            errors.append(message)
+            return ConversionResult(
+                vcon=VConBuilder().build(), meeting_number=meeting_number,
+                group_acronym=group_acronym, session_id=chosen_id,
+                errors=errors, warnings=warnings,
+                meeting_wide_failure=isinstance(e, MeetingReadError),
             )
 
         finally:
@@ -732,12 +957,15 @@ class IETFSessionConverter:
                     else:
                         from .zulip_client import chat_messages_to_json
 
+                        # Inline content needs mediatype (core-05 4.6.6), and a
+                        # list is JSON, not a JSON string, so "none" is wrong.
                         builder.vcon.add_attachment(
                             purpose="chat_log",
                             party=builder.attachment_party,
                             session=builder.session_index,
-                            body=chat_messages_to_json(messages),
-                            encoding="none",
+                            body=json.dumps(chat_messages_to_json(messages), ensure_ascii=False),
+                            encoding="json",
+                            mediatype="application/json",
                         )
 
                     count = len(messages)
@@ -793,12 +1021,26 @@ class IETFSessionConverter:
         )
         if not existing.is_file():
             return
+        # A published file is replaced only by a complete result. One that
+        # cannot be read or migrated must not be silently replaced by a fresh
+        # document with a new uuid, so each of these fails the session.
         try:
-            previous = json.loads(existing.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Could not read %s to carry its content over: %s", existing, e)
-            return
+            raw_previous = json.loads(existing.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            raise CarryOverError(
+                f"{existing.name} exists but cannot be read ({e}); it is left untouched"
+            ) from e
+        if not isinstance(raw_previous, dict):
+            raise CarryOverError(
+                f"{existing.name} exists but is not a vCon object; it is left untouched"
+            )
+        if self.options.preserve_uuid and not raw_previous.get("uuid"):
+            raise CarryOverError(
+                f"{existing.name} exists but has no uuid to keep; it is left untouched"
+            )
 
+        previous = raw_previous
+        previous_created_at = raw_previous.get("created_at")
         if previous.get("vcon") != "0.5.0":
             # A file written before the port is 0.4.0. Migrate it with the
             # reference library so carried dialog and analysis have the
@@ -808,41 +1050,73 @@ class IETFSessionConverter:
 
                 previous = migrate_0_4_0_to_0_5_0(previous).vcon
             except Exception as e:  # noqa: BLE001
-                logger.warning("Could not migrate %s to 0.5.0: %s", existing, e)
-                previous = {"uuid": previous.get("uuid")}
+                raise CarryOverError(
+                    f"{existing.name} cannot be migrated to 0.5.0 ({e}); it is left untouched"
+                ) from e
 
         if self.options.preserve_uuid:
             previous_uuid = previous.get("uuid")
             if previous_uuid and previous_uuid != vcon.vcon_dict.get("uuid"):
                 logger.info("Preserving uuid %s from %s", previous_uuid, existing.name)
                 vcon.vcon_dict["uuid"] = previous_uuid
+                # core-05 4.1.5: created_at "should not change once the vcon
+                # object is created". The uuid says this is the same vCon, so
+                # its creation time stays; 4.1.6 has updated_at record this
+                # regeneration (set by VConBuilder.build()).
+                if previous_created_at:
+                    vcon.vcon_dict["created_at"] = previous_created_at
 
         if self.options.preserve_analysis:
+            self._carry_over_dialog(vcon, previous, existing.name)
             self._carry_over_analysis(vcon, previous, existing.name, warnings)
+        elif raw_previous.get("dialog") and not vcon.vcon_dict.get("dialog"):
+            logger.warning(
+                "CARRY-OVER lost the recording dialog of %s: this build produced "
+                "none and carry-over is off", existing.name,
+            )
+
+        # Last check before anything can be saved: identity and carried
+        # content must all have survived.
+        problems = replacement_problems(raw_previous, vcon.vcon_dict, self.options)
+        if problems:
+            raise CarryOverError(
+                f"the new document must not replace {existing.name}: "
+                + "; ".join(problems)
+            )
+
+    def _carry_over_dialog(self, vcon: Vcon, previous: dict, name: str) -> None:
+        """Reuse the previous dialog when this build produced none.
+
+        Independent of analysis: a recording that was never transcribed must
+        survive a regeneration that does not look the recording up again.
+        """
+        if vcon.vcon_dict.get("dialog") or not previous.get("dialog"):
+            return
+        dialog = previous["dialog"]
+        vcon.vcon_dict["dialog"] = dialog
+        # core-05: the Session lists its Dialogs.
+        sessions = vcon.vcon_dict.get("sessions") or []
+        if sessions:
+            sessions[0]["dialog"] = list(range(len(dialog)))
+        logger.info("CARRY-OVER dialog adopted: %d dialog from %s", len(dialog), name)
+        self._tidy_carried_dialog(vcon, dialog, name)
 
     def _carry_over_analysis(
         self, vcon: Vcon, previous: dict, name: str, warnings: list[str]
     ) -> None:
-        """Bring the previous transcript across, with the dialog it points at.
+        """Bring the previous transcript across.
 
-        Analysis entries address dialog by index, so the two move together. If
-        this conversion produced no dialog of its own the previous dialog comes
-        with the analysis and the indices still resolve; if it did produce
-        dialog, any analysis pointing past the end is left behind rather than
-        carried across as a dangling reference.
+        Analysis entries address dialog by index. _carry_over_dialog has
+        already adopted the previous dialog if this conversion produced none,
+        so the indices still resolve; any analysis pointing past the end of
+        the dialog is left behind rather than carried across as a dangling
+        reference.
         """
         previous_analysis = previous.get("analysis") or []
         if not previous_analysis or vcon.vcon_dict.get("analysis"):
             return
 
         dialog = vcon.vcon_dict.get("dialog") or []
-        if not dialog and previous.get("dialog"):
-            dialog = previous["dialog"]
-            vcon.vcon_dict["dialog"] = dialog
-            # core-05: the Session lists its Dialogs.
-            sessions = vcon.vcon_dict.get("sessions") or []
-            if sessions:
-                sessions[0]["dialog"] = list(range(len(dialog)))
 
         carried, dangling = [], 0
         for analysis in previous_analysis:
@@ -850,6 +1124,16 @@ class IETFSessionConverter:
             if index is not None and index >= len(dialog):
                 dangling += 1
                 continue
+            if (
+                analysis.get("body") is not None
+                and "url" not in analysis
+                and "mediatype" not in analysis
+                and (
+                    analysis.get("encoding") == "json"
+                    or isinstance(analysis["body"], (dict, list))
+                )
+            ):
+                analysis["mediatype"] = "application/json"
             carried.append(analysis)
 
         if dangling:
@@ -863,18 +1147,121 @@ class IETFSessionConverter:
         vcon.vcon_dict["analysis"] = carried
         # The carried content is described by the previous file's extension
         # declarations (wtf_transcription and friends), so those come too.
+        # "role" and "meta" were never extension names, and "CC" is decided by
+        # the parties of this build, not by the previous file.
         extensions = vcon.vcon_dict.setdefault("extensions", [])
         for extension in previous.get("extensions") or []:
-            if extension not in extensions:
+            if extension not in extensions and extension not in ("role", "meta", "CC"):
                 extensions.append(extension)
+        has_role = any(
+            isinstance(p, dict) and p.get("role") for p in vcon.vcon_dict.get("parties") or []
+        )
+        if has_role and "CC" not in extensions:
+            extensions.append("CC")
+        elif not has_role and "CC" in extensions:
+            extensions.remove("CC")
         logger.info("Carried %d analysis entries over from %s", len(carried), name)
+
+    @staticmethod
+    def _retime_carried_recording(session: dict, index: int, dialog: dict, name: str) -> None:
+        """Give an adopted recording the Session's official time.
+
+        A fresh build sets a recording Dialog's ``start`` from the session, and
+        its ``duration`` from the session too unless the recording is a
+        YouTube video, whose own length is used. The Session carries the
+        official values (or none when the session is not on the official
+        schedule), so they are copied from it. Without an official time the
+        carried values stay and a warning lists the recording as unverified.
+        """
+        new_start = session.get("start")
+        if not new_start:
+            if dialog.get("start"):
+                logger.warning(
+                    "CARRY-OVER recording dialog %d from %s: the session has no "
+                    "official time, kept the carried start %s unverified",
+                    index, name, dialog["start"],
+                )
+            return
+        old_start = dialog.get("start")
+        if old_start != new_start:
+            try:
+                changed = datetime.fromisoformat(old_start.replace("Z", "+00:00")) != (
+                    datetime.fromisoformat(new_start)
+                )
+            except (AttributeError, ValueError):
+                changed = True
+            if changed:
+                logger.info(
+                    "CARRY-OVER recording dialog %d from %s: start %s -> %s",
+                    index, name, old_start, new_start,
+                )
+            dialog["start"] = new_start
+        url = str(dialog.get("url") or "")
+        is_youtube = "youtube.com" in url or "youtu.be" in url
+        if session.get("duration") is not None and not is_youtube:
+            if dialog.get("duration") != session["duration"]:
+                logger.info(
+                    "CARRY-OVER recording dialog %d from %s: duration %s -> %s",
+                    index, name, dialog.get("duration"), session["duration"],
+                )
+            dialog["duration"] = session["duration"]
+
+    @staticmethod
+    def _tidy_carried_dialog(vcon: Vcon, dialog: list, name: str) -> None:
+        """Bring adopted dialog in line with this build.
+
+        core-05 has no Dialog ``meta`` or ``metadata``, so both are dropped. The
+        parties of a recording or chat Dialog are every party of the vCon, the
+        rule VConBuilder follows. A previous file's list can index past the end
+        of ``parties`` (an old maintenance script rewrote ``parties`` without
+        touching the Dialogs) or leave parties out, so it is rebuilt from the
+        parties of this build rather than copied.
+        """
+        parties = list(range(len(vcon.vcon_dict.get("parties") or [])))
+        sessions = vcon.vcon_dict.get("sessions") or [{}]
+        for i, d in enumerate(dialog):
+            if not isinstance(d, dict):
+                continue
+            d.pop("meta", None)
+            d.pop("metadata", None)
+            if d.get("type") == "recording":
+                IETFSessionConverter._retime_carried_recording(sessions[0], i, d, name)
+            if d.get("type") not in ("recording", "text"):
+                continue
+            previous_parties = d.get("parties")
+            if previous_parties == (parties or None):
+                continue
+            if d["type"] == "text" and isinstance(previous_parties, list) and len(previous_parties) == 1:
+                # One party is how a sender is written. This converter's chat
+                # Dialog lists every party, so a lone index is either a real
+                # sender or what the 0.4.0 migration reduced it to; flattening
+                # could erase a sender, so it is left alone.
+                logger.warning(
+                    "CARRY-OVER text dialog %d from %s has a single party %s; "
+                    "left as is, not rebuilt to all parties", i, name, previous_parties,
+                )
+                continue
+            logger.info(
+                "CARRY-OVER parties rebuilt: dialog %d from %s had %s, now %s",
+                i, name, previous_parties, parties,
+            )
+            if parties:
+                d["parties"] = parties
+            else:
+                d.pop("parties", None)
 
     def save_vcon(
         self,
         result: ConversionResult,
         output_path: Path | None = None,
     ) -> Path:
-        """Save a conversion result to a file.
+        """Save a conversion result to a file, atomically.
+
+        A published file is replaced only by a complete, verified result. A
+        result with errors is refused, an existing file that cannot be read is
+        left alone, and so is one whose uuid, creation time or carried content
+        the new document would lose. The write itself goes through a temporary
+        file and ``os.replace``, so a kill never leaves a truncated vCon.
 
         Args:
             result: Conversion result
@@ -883,13 +1270,37 @@ class IETFSessionConverter:
         Returns:
             Path to the saved file
         """
+        if result.errors:
+            raise CarryOverError(
+                f"not saving {result.group_acronym} session {result.session_id}: "
+                + result.errors[0]
+            )
         if output_path is None:
             output_path = self.options.output_dir / self._session_filename(
                 result.meeting_number, result.group_acronym, result.session_id
             )
 
+        finalize_vcon(result.vcon.vcon_dict)
+        if output_path.exists():
+            try:
+                previous = json.loads(output_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+                raise CarryOverError(
+                    f"{output_path.name} exists but cannot be read ({e}); it is left untouched"
+                ) from e
+            if not isinstance(previous, dict):
+                raise CarryOverError(
+                    f"{output_path.name} exists but is not a vCon object; it is left untouched"
+                )
+            problems = replacement_problems(previous, result.vcon.vcon_dict, self.options)
+            if problems:
+                raise CarryOverError(
+                    f"the new document must not replace {output_path.name}: "
+                    + "; ".join(problems)
+                )
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(result.vcon.to_json())
+        atomic_write_text(output_path, vcon_file_text(result.vcon))
 
         logger.info("Saved vCon to: %s", output_path)
         return output_path

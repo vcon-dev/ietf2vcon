@@ -205,3 +205,35 @@ def temp_output_dir(tmp_path: Path) -> Path:
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     return output_dir
+
+
+@pytest.fixture(autouse=True)
+def _fresh_chair_cache():
+    """Chair lookups are cached per process; tests must not see each other's."""
+    from ietf2vcon.datatracker import DataTrackerClient
+
+    DataTrackerClient.clear_chair_cache()
+    yield
+    DataTrackerClient.clear_chair_cache()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_meeting_cache():
+    """Meeting records and schedules are cached per process; tests must not share them."""
+    from ietf2vcon.datatracker import DataTrackerClient
+
+    DataTrackerClient.clear_meeting_cache()
+    yield
+    DataTrackerClient.clear_meeting_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_throttle_and_fresh_counters():
+    """The shared request throttle would only slow the suite; counters start at zero."""
+    from ietf2vcon.httpclient import DEFAULT_MAX_RPS, THROTTLE
+    from ietf2vcon.materials import MaterialsDownloader
+
+    THROTTLE.set_rate(0)
+    MaterialsDownloader.reset_counters()
+    yield
+    THROTTLE.set_rate(DEFAULT_MAX_RPS)

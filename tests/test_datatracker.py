@@ -36,6 +36,7 @@ class TestDataTrackerClient:
         client, mock_http = mock_client
 
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.json.return_value = datatracker_meeting_response
         mock_response.raise_for_status = MagicMock()
         mock_http.get.return_value = mock_response
@@ -53,6 +54,7 @@ class TestDataTrackerClient:
         client, mock_http = mock_client
 
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {"meta": {"total_count": 0}, "objects": []}
         mock_response.raise_for_status = MagicMock()
         mock_http.get.return_value = mock_response
@@ -117,18 +119,20 @@ class TestDataTrackerClient:
         """Test getting sessions when none exist."""
         client, mock_http = mock_client
 
-        mock_group_response = MagicMock()
-        mock_group_response.json.return_value = {"id": 2383}
-        mock_group_response.raise_for_status = MagicMock()
+        def respond(url, params=None):
+            response = MagicMock()
+            response.status_code = 200
+            response.raise_for_status = MagicMock()
+            if url == "/api/v1/meeting/meeting/":
+                # a meeting with no official schedule
+                response.json.return_value = {"meta": {"total_count": 1}, "objects": [
+                    {"id": 4360, "number": "121", "schedule": None}
+                ]}
+            else:  # session list, scheduling events: none
+                response.json.return_value = {"meta": {"total_count": 0}, "objects": []}
+            return response
 
-        mock_sessions_response = MagicMock()
-        mock_sessions_response.json.return_value = {
-            "meta": {"total_count": 0},
-            "objects": [],
-        }
-        mock_sessions_response.raise_for_status = MagicMock()
-
-        mock_http.get.side_effect = [mock_group_response, mock_sessions_response]
+        mock_http.get.side_effect = respond
 
         sessions = client.get_group_sessions(121, "nonexistent")
         assert sessions == []
@@ -258,14 +262,14 @@ class TestDataTrackerChairs:
 
         mock_person1_response = MagicMock()
         mock_person1_response.json.return_value = {
-            "name": "Brian Rosen",
+            "name": "Alex Rivera",
             "id": 106987,
         }
         mock_person1_response.raise_for_status = MagicMock()
 
         mock_email1_response = MagicMock()
         mock_email1_response.json.return_value = {
-            "address": "br@brianrosen.net",
+            "address": "alex.rivera@example.net",
         }
         mock_email1_response.raise_for_status = MagicMock()
 
@@ -293,7 +297,7 @@ class TestDataTrackerChairs:
         chairs = client.get_group_chairs("vcon")
 
         assert len(chairs) == 2
-        assert chairs[0].name == "Brian Rosen"
+        assert chairs[0].name == "Alex Rivera"
         assert chairs[0].role == "chair"
         assert chairs[1].name == "Chris Wendt"
 
