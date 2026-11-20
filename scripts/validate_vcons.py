@@ -31,9 +31,14 @@ console = Console()
 WG_ISSUE_URL = (
     "https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40"
 )
-KNOWN_DEVIATION_LABEL = (
+RECORDING_URL_LABEL = (
     "recording Dialog url (YouTube / IETF recording) without content_hash"
 )
+URL_WITHOUT_HASH_NOTE = (
+    "a url without content_hash is allowed on Dialog, Attachment and Analysis,"
+    " following the WG direction on core issue #40 (core-05 text still says MUST)"
+)
+_URL_WITHOUT_HASH_KINDS = {"dialog": "Dialog", "attachments": "Attachment", "analysis": "Analysis"}
 _YOUTUBE_HOSTS = {"youtube.com", "youtu.be"}
 _IETF_RECORDING_PATH = re.compile(r"/audio/|recording|\.(mp3|m4a|mp4|webm)$", re.I)
 
@@ -68,13 +73,13 @@ class VConValidator:
         self._schema_validator = jsonschema.Draft7Validator(self.schema)
         self.errors: list[str] = []
         self.warnings: list[str] = []
-        self.known_deviations: list[str] = []
+        self.url_without_hash: list[str] = []
 
     def reset(self):
-        """Reset errors, warnings and known deviations for a new validation."""
+        """Reset errors, warnings and url-without-hash notes for a new validation."""
         self.errors = []
         self.warnings = []
-        self.known_deviations = []
+        self.url_without_hash = []
 
     def error(self, msg: str):
         """Record an error."""
@@ -120,35 +125,42 @@ class VConValidator:
             self._schema_validator.iter_errors(data), key=lambda e: list(e.absolute_path)
         ):
             where = "/".join(str(p) for p in err.absolute_path) or "(root)"
-            if self._is_known_deviation(data, err):
-                self.known_deviations.append(f"{where}: {KNOWN_DEVIATION_LABEL}")
+            label = self._url_without_hash_label(data, err)
+            if label:
+                self.url_without_hash.append(f"{where}: {label}")
                 continue
             self.error(f"Schema: {where}: {err.message[:200]}")
 
     @staticmethod
-    def _is_known_deviation(data: Any, err: "jsonschema.ValidationError") -> bool:
-        """The one tolerated error: url without content_hash on a recording link.
+    def _url_without_hash_label(data: Any, err: "jsonschema.ValidationError") -> str | None:
+        """Label a url without content_hash on a Dialog, Attachment or Analysis.
 
-        Only a ``dependencies`` failure for ``content_hash`` on a Dialog of
-        type recording whose url is a YouTube or IETF recording URL. An
-        attachment, a non-recording dialog or any other URL stays a failure.
-        See WG issue #40.
+        Following the WG direction on core issue #40, a producer that cannot
+        get stable bytes for a url (a YouTube page, audio behind a login) may
+        leave content_hash out, so the Appendix C ``url -> content_hash``
+        dependency failure is counted and reported, not failed. It still fails
+        on ``redacted_from`` and ``amended_from``. Returns None for any other
+        error.
         """
         path = list(err.absolute_path)
-        if err.validator != "dependencies" or len(path) != 2 or path[0] != "dialog":
-            return False
-        if "'content_hash' is a dependency of 'url'" not in err.message:
-            return False
+        if err.validator != "dependencies" or len(path) != 2:
+            return None
+        kind = _URL_WITHOUT_HASH_KINDS.get(path[0])
+        if kind is None or "'content_hash' is a dependency of 'url'" not in err.message:
+            return None
         try:
-            dialog = data["dialog"][path[1]]
+            obj = data[path[0]][path[1]]
         except (KeyError, IndexError, TypeError):
-            return False
-        return (
-            isinstance(dialog, dict)
-            and dialog.get("type") == "recording"
-            and "content_hash" not in dialog
-            and is_recording_link(dialog.get("url"))
-        )
+            return None
+        if not isinstance(obj, dict) or "content_hash" in obj:
+            return None
+        if (
+            kind == "Dialog"
+            and obj.get("type") == "recording"
+            and is_recording_link(obj.get("url"))
+        ):
+            return RECORDING_URL_LABEL
+        return f"{kind} url without content_hash"
 
     def _validate_sessions(self, data: dict[str, Any]):
         """Core-05 wiring the schema cannot express: index bounds and scoping."""
@@ -452,12 +464,10 @@ class VConValidator:
                 if item["type"] == "wtf_transcription":
                     self._validate_wtf_transcription(item, i)
 
-            # core-05 4.7.11: body and encoding, or url and content_hash
-            if "body" not in item:
-                if "url" not in item:
-                    self.error(f"Analysis {i}: missing both body and url")
-                elif "content_hash" not in item:
-                    self.error(f"Analysis {i}: url without content_hash")
+            # core-05 4.7.11: body and encoding, or url. A url without
+            # content_hash is counted by the schema check (core issue #40).
+            if "body" not in item and "url" not in item:
+                self.error(f"Analysis {i}: missing both body and url")
 
     def _validate_wtf_transcription(self, item: dict, index: int):
         """Validate WTF transcription format."""
@@ -589,7 +599,7 @@ def main():
     for path in sorted(selected):
         success, errors, warnings = validator.validate_file(path)
         results.append(
-            (path.name, success, errors, warnings, validator.known_deviations.copy())
+            (path.name, success, errors, warnings, validator.url_without_hash.copy())
         )
 
     # Display results
@@ -602,10 +612,13 @@ def main():
     total_errors = 0
     total_warnings = 0
     failed_files = 0
-    total_known = sum(len(k) for *_, k in results)
-    files_known = sum(1 for *_, k in results if k)
+    total_no_hash = sum(len(k) for *_, k in results)
+    files_no_hash = sum(1 for *_, k in results if k)
+    recording_no_hash = sum(
+        1 for *_, k in results for note in k if note.endswith(RECORDING_URL_LABEL)
+    )
 
-    for name, success, errors, warnings, _known in results:
+    for name, success, errors, warnings, _no_hash in results:
         status = "[green]✓[/green]" if success else "[red]✗[/red]"
         error_count = str(len(errors)) if errors else "-"
         warning_count = str(len(warnings)) if warnings else "-"
@@ -627,15 +640,15 @@ def main():
     console.print(f"  Total errors: [red]{total_errors}[/red]")
     console.print(f"  Total warnings: [yellow]{total_warnings}[/yellow]")
     console.print(
-        f"  Known deviations (not failures): [yellow]{total_known}[/yellow]"
-        f" in {files_known} file(s); {KNOWN_DEVIATION_LABEL}."
-        f" See {WG_ISSUE_URL}"
+        f"  url without content_hash (allowed, not failures): [cyan]{total_no_hash}[/cyan]"
+        f" in {files_no_hash} file(s), {recording_no_hash} of them recording links;"
+        f" {URL_WITHOUT_HASH_NOTE}. See {WG_ISSUE_URL}"
     )
 
     # Show detailed errors if verbose or if there are failures
     if args.verbose or failed_files > 0:
         console.print("\n[bold]Details:[/bold]")
-        for name, success, errors, warnings, _known in results:
+        for name, success, errors, warnings, _no_hash in results:
             if errors or (args.verbose and warnings):
                 console.print(f"\n[cyan]{name}[/cyan]")
                 for e in errors:

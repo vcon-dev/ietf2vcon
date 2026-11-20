@@ -10,13 +10,13 @@ the Session lists; every attachment is scoped with a party plus that Session
 (or, for a transcript, the Dialog it describes). The Datatracker and Meetecho
 give no join or drop times, so no Events are emitted.
 
-Known deviation: linked recordings (YouTube watch pages, ietf.org audio,
-Meetecho) are Dialogs with ``url`` and no ``content_hash``. Their bytes are not
-stable or not fetchable, so no honest hash exists. core-05 Section 2.4 and
-Appendix C require ``content_hash`` beside ``url``; this departs from that
-pending WG issue
-https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40.
-scripts/validate_vcons.py reports it as a known deviation, not a failure.
+Linked recordings (YouTube watch pages, ietf.org audio, Meetecho) are Dialogs
+with ``url`` and no ``content_hash``. Their bytes are not stable or not
+fetchable, so no honest hash exists. This follows the WG direction on core
+issue https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40,
+which allows a ``url`` without ``content_hash``; the core-05 text (Section 2.4,
+Appendix C) still says MUST until the WG revises it.
+scripts/validate_vcons.py counts and reports these, not as failures.
 """
 
 import base64
@@ -221,9 +221,9 @@ class VConBuilder:
 
         The dialog carries ``url`` and ``mediatype`` only. It has NO
         ``content_hash``: a YouTube watch page is mutable HTML, so no honest
-        hash exists. This departs from vCon core-05 Section 2.4 (and the
-        Appendix C ``url -> content_hash`` dependency) pending WG issue
-        https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40.
+        hash exists. This follows the WG direction on core issue
+        https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40
+        (the core-05 Section 2.4 text still says MUST).
         No Dialog ``meta`` is written either: core-05 defines none.
         """
         start_time = session.start_time or datetime.now(UTC)
@@ -251,8 +251,8 @@ class VConBuilder:
         """Add a linked recording (YouTube, Meetecho, ietf.org MP3) from a URL.
 
         ``url`` and ``mediatype`` only; no ``content_hash`` (none can honestly
-        be computed for these targets), a known departure from core-05
-        Section 2.4 pending WG issue #40. No Dialog ``meta``.
+        be computed for these targets), following the WG direction on core
+        issue #40. No Dialog ``meta``.
         """
         start_time = session.start_time or datetime.now(UTC)
 

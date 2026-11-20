@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Validator
+
+- A `url` without `content_hash` follows the WG direction on core issue #40
+  (https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40) and is
+  allowed on a Dialog, Attachment or Analysis. `scripts/validate_vcons.py`
+  counts and reports these (recording links labelled as such) instead of
+  calling recording links "known deviations". Attachments, non-recording
+  Dialogs and Analysis entries with a `url` and no `content_hash` used to fail;
+  they are now counted the same way. `redacted_from` and `amended_from` with a
+  `url` still need `content_hash`. `VConValidator.known_deviations` is renamed
+  `url_without_hash`.
+
 ## 0.3.0
 
 Port to vCon core-05 (syntax "0.5.0"). Requires `vcon>=1.0.0,<2`. Not on the

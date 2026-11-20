@@ -292,7 +292,7 @@ def structural_errors(vcon, tmp_path):
     out.parent.mkdir()
     out.write_text(json.dumps(vcon.vcon_dict))
     ok, errors, _ = validator.validate_file(out)
-    return errors, validator.known_deviations
+    return errors, validator.url_without_hash
 
 
 @pytest.mark.parametrize("analysis", [[], ...], ids=["empty analysis", "no analysis key"])
