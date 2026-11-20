@@ -79,11 +79,13 @@ class TestAnalysisContent:
         ok, errors = run(validator, tmp_path, mutated(change))
         assert not ok and any("missing both body and url" in e for e in errors)
 
-    def test_url_without_content_hash_is_an_error(self, validator, tmp_path):
+    def test_url_without_content_hash_is_counted_not_failed(self, validator, tmp_path):
+        # core issue #40: a url without content_hash is allowed on Analysis
         def change(d):
             del d["analysis"][0]["content_hash"]
         ok, errors = run(validator, tmp_path, mutated(change))
-        assert not ok and any("url without content_hash" in e for e in errors)
+        assert ok, errors
+        assert validator.url_without_hash == ["analysis/0: Analysis url without content_hash"]
 
 
 class TestUndefinedMeta:
@@ -151,7 +153,7 @@ class TestIndexRanges:
         assert ok, errors
 
 
-def test_known_deviation_handling_is_unchanged(validator, tmp_path):
+def test_recording_url_without_hash_is_counted(validator, tmp_path):
     data = base()
     data["dialog"] = [{
         "type": "recording", "start": NOW, "parties": [0, 1], "mediatype": "video/mp4",
@@ -161,7 +163,7 @@ def test_known_deviation_handling_is_unchanged(validator, tmp_path):
     path.write_text(json.dumps(data))
     ok, errors, _ = validator.validate_file(path)
     assert ok, errors
-    assert len(validator.known_deviations) == 1
+    assert len(validator.url_without_hash) == 1
 
 
 class TestUrlNamesTheFile:

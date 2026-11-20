@@ -423,23 +423,28 @@ no extension is not compared).
 | Chat Logs | Zulip | https://zulip.ietf.org/ |
 
 
-## Known deviation: recording links carry no content_hash
+## Recording links carry no content_hash (core issue #40)
 
 Linked recordings (YouTube watch pages, ietf.org audio, Meetecho) are Dialogs
 with `url` and `mediatype` and no `content_hash`. None can honestly be
 computed: a watch page is mutable HTML and the audio files are login-gated or
-not fetched. This departs from vCon core-05 Section 2.4 (and the Appendix C
-`url -> content_hash` dependency) pending WG issue
-https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40. No hash is
-ever invented; recording bytes that are actually fetched get a real SHA-512.
-`scripts/validate_vcons.py` validates against the vendored Appendix C schema
-and reports this one case as a known deviation with a count, not a failure.
-Any other schema error still fails. The validator also fails a file with a
-`meta` key on a party, dialog or attachment, with `role` or `meta` in
-`extensions`, with a party `role` and no `CC` in `extensions`, or with a party,
-dialog, session or attachment index out of range. An analysis entry may carry
-`body` or `url` plus `content_hash`; one with neither, or a `url` without
-`content_hash`, fails.
+not fetched. No hash is ever invented; recording bytes that are actually
+fetched get a real SHA-512. This follows the WG direction on
+https://github.com/ietf-wg-vcon/draft-ietf-vcon-vcon-core/issues/40: a `url`
+without `content_hash` is allowed on a Dialog, Attachment or Analysis when the
+producer cannot get stable bytes. The core-05 text (Section 2.4 and the
+Appendix C `url -> content_hash` dependency) still says MUST until the WG
+revises it. The Python `vcon` library allows it from 1.0.6.
+
+`scripts/validate_vcons.py` validates against the vendored Appendix C schema.
+A `url` without `content_hash` on a Dialog, Attachment or Analysis is counted
+and reported (recording links are labelled as such), not failed. It still
+fails on `redacted_from` and `amended_from`, and any other schema error still
+fails. The validator does not check the `content_hash` format. It also fails a
+file with a `meta` key on a party, dialog or attachment, with `role` or `meta`
+in `extensions`, with a party `role` and no `CC` in `extensions`, or with a
+party, dialog, session or attachment index out of range. An analysis entry
+needs a `body` or a `url`; one with neither fails.
 
 ## Known limitations
 

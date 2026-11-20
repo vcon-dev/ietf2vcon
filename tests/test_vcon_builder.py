@@ -150,7 +150,7 @@ class TestVConBuilderDialogs:
         # "video" is not one of them; the media type carries the video-ness.
         assert vcon.dialog[0]["type"] == "recording"
         # Linked recording: url + mediatype, no content_hash, no meta (core-05
-        # defines no Dialog meta). Known departure pending WG issue #40.
+        # defines no Dialog meta). A url without hash follows WG issue #40.
         assert vcon.dialog[0]["mediatype"] == "video/mp4"
         assert vcon.dialog[0]["url"] == sample_video_metadata.url
         assert "content_hash" not in vcon.dialog[0]
