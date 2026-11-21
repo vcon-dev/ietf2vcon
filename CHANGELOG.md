@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- YouTube captions: fetch the original-language auto-caption track (`en-orig`) first, then `en`. On videos whose captions YouTube offers in many languages, `en` is a machine translation (`tlang=en`) that YouTube answers with HTTP 429, so IETF 127 sessions were saved without transcripts.
+
 ### Validator
 
 - A `url` without `content_hash` follows the WG direction on core issue #40
