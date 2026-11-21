@@ -296,6 +296,13 @@ class YouTubeResolver:
     ) -> Path | None:
         """Download captions/subtitles from a YouTube video.
 
+        The original-language track (``<lang>-orig``) is tried first, then
+        ``<lang>``. On videos whose auto-captions YouTube offers in many
+        languages, ``<lang>`` is a machine translation (``tlang=<lang>``),
+        which YouTube rate-limits heavily (HTTP 429); ``<lang>-orig`` is the
+        speech-recognition track itself. Videos without an ``-orig`` track get
+        ``<lang>`` as before.
+
         Args:
             video_url: YouTube video URL
             output_filename: Optional custom filename (without extension)
@@ -304,61 +311,57 @@ class YouTubeResolver:
         Returns:
             Path to downloaded caption file (JSON format), or None if failed
         """
+        video_id = self._extract_video_id(video_url) or video_url
+        output_base = output_filename or video_id
+        captions_dir = self.download_dir / "captions"
+        captions_dir.mkdir(parents=True, exist_ok=True)
+
+        for track in (f"{lang}-orig", lang):
+            path = self._download_caption_track(video_id, output_base, captions_dir, track)
+            if path is not None:
+                return path
+
+        logger.warning("No caption file found after download")
+        return None
+
+    def _download_caption_track(
+        self, video_id: str, output_base: str, captions_dir: Path, track: str
+    ) -> Path | None:
+        """Fetch one caption track with yt-dlp; return its json3 file or None."""
         try:
-            video_id = self._extract_video_id(video_url) or video_url
-            output_base = output_filename or video_id
-
-            # Create captions directory
-            captions_dir = self.download_dir / "captions"
-            captions_dir.mkdir(parents=True, exist_ok=True)
-
-            output_template = str(captions_dir / output_base)
-
-            # Try to get auto-generated captions first, then manual
             result = subprocess.run(
                 [
                     "yt-dlp",
                     "--write-auto-sub",
                     "--write-sub",
-                    "--sub-lang", lang,
+                    "--sub-lang", track,
                     "--sub-format", "json3",
                     "--skip-download",
-                    "-o", output_template,
+                    "-o", str(captions_dir / output_base),
                     f"https://www.youtube.com/watch?v={video_id}",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=120,
             )
-
-            if result.returncode != 0:
-                logger.warning(f"Caption download failed: {result.stderr}")
-                return None
-
-            # Find the downloaded caption file
-            possible_files = [
-                captions_dir / f"{output_base}.{lang}.json3",
-                captions_dir / f"{output_base}.{lang}.json",
-            ]
-
-            for caption_file in possible_files:
-                if caption_file.exists():
-                    logger.info(f"Downloaded captions: {caption_file}")
-                    return caption_file
-
-            # Check for any json3 files that were created
-            for f in captions_dir.glob(f"{output_base}*.json3"):
-                logger.info(f"Downloaded captions: {f}")
-                return f
-
-            logger.warning("No caption file found after download")
+        except subprocess.TimeoutExpired:
+            logger.error(f"Caption download timed out ({track})")
+            return None
+        except Exception as e:
+            logger.error(f"Caption download failed ({track}): {e}")
             return None
 
-        except subprocess.TimeoutExpired:
-            logger.error("Caption download timed out")
-        except Exception as e:
-            logger.error(f"Caption download failed: {e}")
+        if result.returncode != 0:
+            logger.warning(f"Caption download failed ({track}): {result.stderr}")
+            return None
 
+        for caption_file in (
+            captions_dir / f"{output_base}.{track}.json3",
+            captions_dir / f"{output_base}.{track}.json",
+        ):
+            if caption_file.exists():
+                logger.info(f"Downloaded captions: {caption_file}")
+                return caption_file
         return None
 
     def get_available_captions(self, video_url: str) -> list[dict]:

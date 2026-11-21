@@ -1,3 +1,4 @@
+from pathlib import Path
 """Unit tests for ietf2vcon.youtube module."""
 
 import pytest
@@ -176,3 +177,48 @@ class TestYouTubeResolverIntegration:
 
         assert result is not None
         assert result.exists()
+
+
+class TestCaptionTrackOrder:
+    """download_captions tries the original-language track before the translated one."""
+
+    def _fake_run(self, tmp_path, succeed_on):
+        calls = []
+
+        def run(cmd, **kwargs):
+            track = cmd[cmd.index("--sub-lang") + 1]
+            calls.append(track)
+            out = cmd[cmd.index("-o") + 1]
+
+            class R:
+                returncode = 0
+                stderr = ""
+
+            if track in succeed_on:
+                Path(f"{out}.{track}.json3").write_text('{"events": []}')
+            elif track == "en":
+                R.returncode = 1
+                R.stderr = "ERROR: Unable to download video subtitles for 'en': HTTP Error 429"
+            return R
+
+        return run, calls
+
+    def test_original_track_first(self, tmp_path, monkeypatch):
+        run, calls = self._fake_run(tmp_path, {"en-orig", "en"})
+        monkeypatch.setattr("ietf2vcon.youtube.subprocess.run", run)
+        path = YouTubeResolver(download_dir=tmp_path).download_captions("https://youtu.be/abcdefghijk", "m_g")
+        assert calls == ["en-orig"]
+        assert path.name == "m_g.en-orig.json3"
+
+    def test_falls_back_to_lang_without_orig_track(self, tmp_path, monkeypatch):
+        run, calls = self._fake_run(tmp_path, {"en"})
+        monkeypatch.setattr("ietf2vcon.youtube.subprocess.run", run)
+        path = YouTubeResolver(download_dir=tmp_path).download_captions("https://youtu.be/abcdefghijk", "m_g")
+        assert calls == ["en-orig", "en"]
+        assert path.name == "m_g.en.json3"
+
+    def test_none_when_no_track(self, tmp_path, monkeypatch):
+        run, calls = self._fake_run(tmp_path, set())
+        monkeypatch.setattr("ietf2vcon.youtube.subprocess.run", run)
+        assert YouTubeResolver(download_dir=tmp_path).download_captions("https://youtu.be/abcdefghijk") is None
+        assert calls == ["en-orig", "en"]
