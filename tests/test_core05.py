@@ -97,7 +97,7 @@ def test_chat_log_attachment_is_json_with_mediatype(
     chat = next(a for a in data["attachments"] if a["purpose"] == "chat_log")
     assert chat["encoding"] == "json"
     assert chat["mediatype"] == "application/json"
-    assert [m["content"] for m in json.loads(chat["body"])] == [
+    assert [m["content"] for m in chat["body"]] == [
         m.content for m in sample_chat_messages
     ]
 

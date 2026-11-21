@@ -1,7 +1,7 @@
 """Unit tests for ietf2vcon.vcon_builder module."""
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -128,8 +128,8 @@ class TestVConBuilderMetadata:
             (a for a in vcon.attachments if a.get("purpose") == "meeting_metadata"), None
         )
         assert metadata_att is not None
-        assert json.loads(metadata_att["body"])["ietf_meeting_number"] == 121
-        assert json.loads(metadata_att["body"])["working_group"] == "vcon"
+        assert metadata_att["body"]["ietf_meeting_number"] == 121
+        assert metadata_att["body"]["working_group"] == "vcon"
 
 
 class TestVConBuilderDialogs:
@@ -227,7 +227,7 @@ class TestVConBuilderMaterials:
         assert att is not None
         # No content to hash, so this stays a body reference -- as a JSON
         # *string*, which is what the spec requires of every body.
-        body = json.loads(att["body"])
+        body = att["body"]
         assert body["url"] == "https://example.com/slides.pdf"
         assert body["title"] == "Test Slides"
         assert att["encoding"] == "json"
@@ -270,8 +270,8 @@ class TestVConBuilderTranscript:
         assert wtf is not None
         assert wtf["vendor"], "vendor is required on every analysis object"
         assert wtf["encoding"] == "json"
-        assert isinstance(wtf["body"], str), "analysis body must be a string"
-        body = json.loads(wtf["body"])
+        assert isinstance(wtf["body"], dict), "a json analysis body is the JSON value (core-05 2.3.2)"
+        body = wtf["body"]
         assert body["transcript"]["text"]
         assert body["segments"]
         assert "wtf_transcription" in vcon.vcon_dict["extensions"]
@@ -320,7 +320,7 @@ class TestVConBuilderTranscript:
         vcon = builder.build()
 
         lb = next(a for a in vcon.attachments if a["purpose"] == "lawful_basis")
-        grants = json.loads(lb["body"])["purpose_grants"]
+        grants = lb["body"]["purpose_grants"]
         assert grants
         assert {g["granted_at"] for g in grants} == {vcon.vcon_dict["sessions"][0]["start"]}
 
@@ -339,7 +339,7 @@ class TestVConBuilderTranscript:
 
         assert "start" not in vcon.vcon_dict["sessions"][0]
         lb = next(a for a in vcon.attachments if a["purpose"] == "lawful_basis")
-        grants = json.loads(lb["body"])["purpose_grants"]
+        grants = lb["body"]["purpose_grants"]
         assert {g["granted_at"] for g in grants} == {"2024-11-04T00:00:00+00:00"}
 
     def test_note_well_carries_proof_mechanisms(self):
@@ -352,11 +352,13 @@ class TestVConBuilderTranscript:
             a for a in vcon.attachments
             if (a.get("purpose") or a.get("type")) == "lawful_basis"
         )
-        body = json.loads(lb["body"])
+        body = lb["body"]
         assert body["lawful_basis"] == "legitimate_interests"
         assert body["proof_mechanisms"], "proof_mechanisms[] must not be empty"
-        assert all(m.get("mechanism_type") for m in body["proof_mechanisms"])
-        assert all(m.get("description") for m in body["proof_mechanisms"])
+        # draft-howe-vcon-lawful-basis: proof_type, timestamp, proof_data
+        assert all(m.get("proof_type") == "external_system" for m in body["proof_mechanisms"])
+        assert all(m.get("timestamp") for m in body["proof_mechanisms"])
+        assert all(m["proof_data"].get("description") for m in body["proof_mechanisms"])
 
     def test_add_analysis_generic(self):
         """Test adding generic analysis."""
@@ -391,9 +393,9 @@ class TestVConBuilderLawfulBasis:
             (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
         )
         assert lb_att is not None
-        assert json.loads(lb_att["body"])["lawful_basis"] == "consent"
+        assert lb_att["body"]["lawful_basis"] == "consent"
         # Extra fields are in metadata sub-dict per vcon-lib API
-        assert json.loads(lb_att["body"])["metadata"]["jurisdiction"] == "US"
+        assert lb_att["body"]["metadata"]["jurisdiction"] == "US"
 
     def test_add_ietf_note_well(self):
         """Test adding IETF Note Well."""
@@ -405,10 +407,10 @@ class TestVConBuilderLawfulBasis:
             (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
         )
         assert lb_att is not None
-        assert json.loads(lb_att["body"])["lawful_basis"] == "legitimate_interests"
-        assert json.loads(lb_att["body"])["terms_of_service"] == "https://www.ietf.org/about/note-well/"
-        assert json.loads(lb_att["body"])["metadata"]["terms_of_service_name"] == "IETF Note Well"
-        assert json.loads(lb_att["body"])["metadata"]["controller"] == "Internet Engineering Task Force (IETF)"
+        assert lb_att["body"]["lawful_basis"] == "legitimate_interests"
+        assert lb_att["body"]["terms_of_service"] == "https://www.ietf.org/about/note-well/"
+        assert lb_att["body"]["metadata"]["terms_of_service_name"] == "IETF Note Well"
+        assert lb_att["body"]["metadata"]["controller"] == "Internet Engineering Task Force (IETF)"
 
     def test_note_well_purpose_grants(self):
         """Test Note Well includes all required purpose grants."""
@@ -419,7 +421,7 @@ class TestVConBuilderLawfulBasis:
         lb_att = next(
             (a for a in vcon.attachments if a.get("purpose") == "lawful_basis"), None
         )
-        purposes = [g["purpose"] for g in json.loads(lb_att["body"])["purpose_grants"]]
+        purposes = [g["purpose"] for g in lb_att["body"]["purpose_grants"]]
 
         assert "recording" in purposes
         assert "transcription" in purposes
@@ -445,8 +447,8 @@ class TestVConBuilderIngressInfo:
             (a for a in vcon.attachments if a.get("purpose") == "ingress_info"), None
         )
         assert ing_att is not None
-        assert json.loads(ing_att["body"])["source"] == "ietf2vcon"
-        assert json.loads(ing_att["body"])["meeting_number"] == 121
+        assert ing_att["body"]["source"] == "ietf2vcon"
+        assert ing_att["body"]["meeting_number"] == 121
         assert "converted_at" in ing_att["body"]
 
 
@@ -481,7 +483,7 @@ class TestSessionStatusInMetadata:
         builder.add_ietf_note_well()
         vcon = builder.build()
         attachments = {a["purpose"]: a for a in vcon.attachments}
-        return vcon, json.loads(attachments["meeting_metadata"]["body"]), attachments
+        return vcon, attachments["meeting_metadata"]["body"], attachments
 
     def test_status_is_recorded_for_a_scheduled_session(self, sample_ietf_session):
         session = sample_ietf_session.model_copy(update={"status": "sched"})
@@ -505,7 +507,7 @@ class TestSessionStatusInMetadata:
         assert body["room"] is None
         assert "start" not in vcon.vcon_dict["sessions"][0]
         assert "duration" not in vcon.vcon_dict["sessions"][0]
-        grants = json.loads(attachments["lawful_basis"]["body"])["purpose_grants"]
+        grants = attachments["lawful_basis"]["body"]["purpose_grants"]
         assert {g["granted_at"] for g in grants} == {"2017-11-12T00:00:00+00:00"}
 
     def test_no_status_key_when_the_status_is_unknown(self, sample_ietf_session):
@@ -555,8 +557,8 @@ class TestLawfulBasisProofEntries:
 
     def _proofs(self, vcon):
         lb = next(a for a in vcon.attachments if a["purpose"] == "lawful_basis")
-        assert isinstance(lb["body"], str)  # still a JSON string
-        return [p["description"] for p in json.loads(lb["body"])["proof_mechanisms"]]
+        assert isinstance(lb["body"], dict)  # the JSON value
+        return [p["proof_data"]["description"] for p in lb["body"]["proof_mechanisms"]]
 
     def test_scheduled_with_bluesheets_gives_both_entries(self):
         assert self._proofs(self._vcon("sched", True)) == [NOTE_WELL_ENTRY, BLUESHEETS_ENTRY]
@@ -601,13 +603,26 @@ class TestLawfulBasisProofEntries:
         assert builder.build().attachments[-1]["body"] == first
 
     def test_nothing_else_in_the_body_changes(self):
-        with_sheets = json.loads(
-            next(a for a in self._vcon("sched", True).attachments if a["purpose"] == "lawful_basis")["body"]
-        )
-        without = json.loads(
-            next(a for a in self._vcon("sched", False).attachments if a["purpose"] == "lawful_basis")["body"]
-        )
+        with_sheets = next(
+            a for a in self._vcon("sched", True).attachments if a["purpose"] == "lawful_basis"
+        )["body"]
+        without = next(
+            a for a in self._vcon("sched", False).attachments if a["purpose"] == "lawful_basis"
+        )["body"]
         with_sheets["proof_mechanisms"] = with_sheets["proof_mechanisms"][:1]
         with_sheets.pop("expiration"), without.pop("expiration")
         assert with_sheets == without
         assert list(with_sheets) == list(without)  # same key order too
+
+
+def test_note_well_passes_the_vcon_lawful_basis_validator():
+    """vcon 1.0.4+ checks lawful_basis bodies in is_valid(); the Note Well must pass."""
+    from vcon.extensions.lawful_basis.validation import LawfulBasisValidator
+
+    builder = VConBuilder()
+    builder.add_ietf_note_well(session_start=datetime(2026, 11, 18, 19, 30, tzinfo=UTC))
+    lb = next(a for a in builder.build().attachments if a["purpose"] == "lawful_basis")
+    assert isinstance(lb["body"], dict)
+    result = LawfulBasisValidator().validate_attachment(lb)
+    assert result.errors == []
+    assert {p["timestamp"] for p in lb["body"]["proof_mechanisms"]} == {"2026-11-18T19:30:00+00:00"}

@@ -193,7 +193,7 @@ class TestPollsAndMissingDocuments:
         att = builder.vcon.vcon_dict["attachments"][-1]
         assert att["purpose"] == "document"
         assert att["encoding"] == "json" and "url" not in att
-        assert json.loads(att["body"])["url"] == self.POLLS.url
+        assert att["body"]["url"] == self.POLLS.url
 
     def test_a_404_is_a_warning_not_an_error(self, tmp_path, caplog):
         downloader = MaterialsDownloader(download_dir=tmp_path / "m")

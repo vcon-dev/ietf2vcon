@@ -35,7 +35,7 @@ def test_the_ingress_info_records_the_package_version():
     attachment = next(
         a for a in builder.build().vcon_dict["attachments"] if a["purpose"] == "ingress_info"
     )
-    assert json.loads(attachment["body"])["converter_version"] == ietf2vcon.__version__
+    assert attachment["body"]["converter_version"] == ietf2vcon.__version__
 
 
 def test_the_release_version_is_0_3_0():
