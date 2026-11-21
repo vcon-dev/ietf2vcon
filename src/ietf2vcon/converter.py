@@ -963,7 +963,7 @@ class IETFSessionConverter:
                             purpose="chat_log",
                             party=builder.attachment_party,
                             session=builder.session_index,
-                            body=json.dumps(chat_messages_to_json(messages), ensure_ascii=False),
+                            body=chat_messages_to_json(messages),
                             encoding="json",
                             mediatype="application/json",
                         )

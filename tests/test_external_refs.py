@@ -53,7 +53,7 @@ def materials_info(builder):
         a for a in builder.vcon.vcon_dict["attachments"]
         if a["purpose"] == "meeting_metadata"
     )
-    return json.loads(att["body"]).get("materials", [])
+    return att["body"].get("materials", [])
 
 
 def attachments(builder):
@@ -91,7 +91,7 @@ def test_landing_page_stays_a_body_reference(builder):
 
     assert att.get("url") is None
     assert att.get("content_hash") is None
-    assert json.loads(att["body"])["url"] == SESSION_PAGE.url
+    assert att["body"]["url"] == SESSION_PAGE.url
 
 
 def test_unfetchable_material_stays_a_body_reference(builder):
@@ -100,7 +100,7 @@ def test_unfetchable_material_stays_a_body_reference(builder):
     att = attachments(builder)[-1]
 
     assert att.get("url") is None
-    assert json.loads(att["body"])["url"] == SLIDES.url
+    assert att["body"]["url"] == SLIDES.url
 
 
 def test_inline_material_hashes_in_spec_form(builder):
@@ -364,7 +364,7 @@ class TestMaterialsInMeetingMetadata:
         assert [m["filename"] for m in materials_info(builder)] == ["a.pdf", "b.pdf"]
         assert [m["title"] for m in materials_info(builder)] == ["First", "Second"]
 
-    def test_meeting_metadata_keeps_its_position_and_stays_a_json_string(self, builder):
+    def test_meeting_metadata_keeps_its_position_and_is_a_json_value(self, builder):
         builder.add_ingress_info()
         builder.add_material_attachment(self._material("slides", "a", "First"), content=b"1")
 
@@ -372,7 +372,7 @@ class TestMaterialsInMeetingMetadata:
             "meeting_metadata", "ingress_info", "slides",
         ]
         first = attachments(builder)[0]
-        assert isinstance(first["body"], str) and first["mediatype"] == "application/json"
+        assert isinstance(first["body"], dict) and first["mediatype"] == "application/json"
 
     def test_missing_values_are_omitted_not_null(self, builder):
         material = IETFMaterial(
@@ -602,7 +602,7 @@ class TestUrlNamesTheFileThatWasHashed:
 
         assert "url" not in att and "content_hash" not in att
         assert att["encoding"] == "json"
-        assert json.loads(att["body"])["url"] == material.url
+        assert att["body"]["url"] == material.url
         assert any("other.pptx" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
 
     def test_an_older_document_with_no_file_url_keeps_the_page_url(self, builder):

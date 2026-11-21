@@ -216,3 +216,17 @@ Existing 0.4.0 files are regenerated in place with
 are kept (`preserve_uuid` and `preserve_analysis` default on) when the output
 directory still holds the previous files. A file that cannot be regenerated
 completely is left untouched.
+
+### Changed
+- `encoding: "json"` bodies are written as the JSON value itself (core-05
+  section 2.3.2), not a serialized string: meeting metadata, materials,
+  ingress info, lawful basis, chat log and the WTF transcription. Earlier
+  releases followed the core-02 reading; vcon 1.0.4 and later warn on string
+  bodies.
+
+### Fixed
+- The IETF Note Well lawful-basis proof mechanisms use the fields
+  draft-howe-vcon-lawful-basis requires: `proof_type`, `timestamp` (the grant
+  time) and `proof_data` (holding the description). They were
+  `{mechanism_type, description}`, which fails `is_valid()` in vcon 1.0.4 and
+  later.

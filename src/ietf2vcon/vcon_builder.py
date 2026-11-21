@@ -49,9 +49,14 @@ from .zulip_client import chat_messages_to_json, chat_messages_to_text
 logger = logging.getLogger(__name__)
 
 
-def json_body(payload: dict[str, Any]) -> str:
-    """Serialize an attachment body. Bodies are strings, never objects."""
-    return json.dumps(payload, ensure_ascii=False)
+def json_body(payload: dict[str, Any]) -> dict[str, Any]:
+    """The body of an ``encoding: "json"`` entry.
+
+    Core-05 section 2.3.2: for ``"json"`` the body is the JSON value itself
+    (an object here), not a serialized string. Releases before 0.4.0 wrote a
+    string, following the core-02 reading; vcon 1.0.4 and later warn on that.
+    """
+    return payload
 
 
 class VConBuilder:
@@ -144,7 +149,7 @@ class VConBuilder:
             session=self.session_index,
             encoding="json",
             mediatype="application/json",
-            body="{}",
+            body={},
         )
         self._write_meeting_metadata()
 
@@ -407,21 +412,18 @@ class VConBuilder:
             self._materials_info.append(info)
             self._write_meeting_metadata()
         else:
-            # body MUST be a string, even when the content is JSON. Emitting a
-            # dict here is what the repo's core-02 migration had to clean up
-            # across the whole published corpus.
+            # A "json" body is the JSON value itself (core-05 section 2.3.2).
             self.vcon.add_attachment(
                 purpose=material.type,
                 party=self.attachment_party,
                 session=self.session_index,
-                body=json.dumps(
+                body=json_body(
                     {
                         "url": material.url,
                         "mimetype": material.mimetype,
                         "filename": material.filename,
                         "title": material.title,
-                    },
-                    ensure_ascii=False,
+                    }
                 ),
                 encoding="json",
                 mediatype="application/json",
@@ -645,19 +647,24 @@ class VConBuilder:
             party_index=self.attachment_party,
             session_index=self.session_index,
         )
-        # vcon-lib's extension helper leaves the body as an object. The spec
-        # wants a string, so normalize here rather than emit a body no
-        # conforming reader should accept.
         attachment = self.vcon.vcon_dict["attachments"][-1]
         attachment.setdefault("mediatype", "application/json")
         body = attachment.get("body")
+        if isinstance(body, str):
+            body = json.loads(body)
         if isinstance(body, dict):
             # A basis with no proof_mechanisms[] is hollow: it asserts a basis
             # without saying what evidences it. vcon-lib's helper has no
-            # parameter for the field, so it is set on the body before the
-            # body is serialized.
+            # parameter for the field, so it is set on the body here. Each
+            # entry carries the fields draft-howe-vcon-lawful-basis requires
+            # (proof_type, timestamp, proof_data); the timestamp defaults to
+            # the grant time.
             if proof_mechanisms:
-                body["proof_mechanisms"] = proof_mechanisms
+                body["proof_mechanisms"] = [
+                    {**p, "timestamp": p.get("timestamp") or granted_at.isoformat()}
+                    for p in proof_mechanisms
+                ]
+                self._lawful_proofs = [dict(p) for p in body["proof_mechanisms"]]
             attachment["body"] = json_body(body)
             attachment["encoding"] = "json"
         return self
@@ -670,12 +677,14 @@ class VConBuilder:
         """
         proof_mechanisms = [
             {
-                "mechanism_type": "external_system",
-                "description": (
-                    "IETF Note Well, the IETF's published policy for meeting "
-                    "participation, at https://www.ietf.org/about/note-well/. "
-                    "Participation in an IETF session constitutes agreement to it."
-                ),
+                "proof_type": "external_system",
+                "proof_data": {
+                    "description": (
+                        "IETF Note Well, the IETF's published policy for meeting "
+                        "participation, at https://www.ietf.org/about/note-well/. "
+                        "Participation in an IETF session constitutes agreement to it."
+                    ),
+                },
             },
         ]
         # The second mechanism asserts that the session was held and that its
@@ -686,12 +695,14 @@ class VConBuilder:
         # unknown status keeps it, as before.
         if self._session_status in (None, MET_STATUS):
             proof_mechanisms.append({
-                "mechanism_type": "external_system",
-                "description": (
-                    "IETF Datatracker session record, including the bluesheets "
-                    "attendance document referenced by this vCon, evidencing that "
-                    "the session was held and published under that policy."
-                ),
+                "proof_type": "external_system",
+                "proof_data": {
+                    "description": (
+                        "IETF Datatracker session record, including the bluesheets "
+                        "attendance document referenced by this vCon, evidencing that "
+                        "the session was held and published under that policy."
+                    ),
+                },
             })
         self._lawful_proofs = [dict(p) for p in proof_mechanisms]
         result = self.add_lawful_basis(
@@ -729,13 +740,14 @@ class VConBuilder:
         The entry refers to "the bluesheets attendance document referenced by
         this vCon". Materials are added after the lawful basis, so whether the
         reference is true is only known once the attachments are final. The
-        attachment keeps its position and its body stays a JSON string; the
-        wording of the entries is not changed.
+        attachment keeps its position; the wording of the entries is not changed.
         """
         if self._lawful_basis_index is None or not self._lawful_proofs:
             return
         attachment = self.vcon.vcon_dict["attachments"][self._lawful_basis_index]
-        body = json.loads(attachment["body"])
+        body = attachment["body"]
+        if isinstance(body, str):
+            body = json.loads(body)
         has_bluesheets = any(
             isinstance(a, dict) and a.get("purpose") == "bluesheets"
             for a in self.vcon.vcon_dict["attachments"]
